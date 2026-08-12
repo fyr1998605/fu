@@ -1,0 +1,11 @@
+<launch>
+    <rosparam file="$(find rm_node)/config/antigyro.yaml" command="load"/>
+    
+    <include file="$(find rm_hikcamera)/launch/rm_hikcamera.launch"/>
+    <include file="$(find rm_serial)/launch/rm_serial.launch"/>
+    <include file="$(find rm_identify)/launch/rm_identify.launch"/>
+    <!-- <include file="$(find rm_tracker)/launch/rm_tracker.launch"/> -->
+
+    <node pkg="rviz" type="rviz" name="rviz" args="-d $(find rm_node)/config/vision.rviz" />
+
+</launch>

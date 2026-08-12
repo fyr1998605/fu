@@ -1,0 +1,16 @@
+<launch>
+    <arg name="shootflag_test" default="a" />
+    <arg name="camp_test"       default="r" />
+    <arg name="sim_mode"        default="false" />
+
+    <node name="serial" pkg="rm_serial" type="rm_serial_node" output="screen" respawn="true">
+        <param name="armor_serial_config"
+               type="string"
+               value="$(find rm_serial)/config/rm_serial.yaml" />
+
+        <!-- 模拟模式参数: 无串口硬件时使用 (sim_mode=true 或自动检测无串口) -->
+        <param name="sim_mode"        value="$(arg sim_mode)" />
+        <param name="shootflag_test"  value="$(arg shootflag_test)" />
+        <param name="camp_test"        value="$(arg camp_test)" />
+    </node>
+</launch>

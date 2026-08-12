@@ -1,0 +1,19 @@
+# true 1 和 false 0 
+width: 1280            #图像宽度
+height: 1024            #图像高度
+Offset_x: 0             #X方向偏置
+Offset_y: 0             #Y方向偏置
+
+FrameRateEnable: true   #使能 
+FrameRate: 120          #帧率120
+
+ExposureTime: 3000   #曝光时间9000    2300 1800 1550
+
+GammaEnable: false
+Gamma: 1              #伽马因子
+
+# GainAuto: 1             #亮度的自动增益
+# Gain: 16          #亮度的固定增益
+
+SaturationEnable: false
+Saturation: 128         #饱和度

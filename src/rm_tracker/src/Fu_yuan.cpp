@@ -1,0 +1,2320 @@
+ #include "opencv2/opencv.hpp"
+ #include <ceres/ceres.h>
+ #include <Eigen/Dense>
+ #include <stdexcept>
+ #include <random>
+ #include <algorithm>
+ #include <iostream>
+ #include <fftw3.h>
+ #include <fstream>
+ #include <vector>
+ #include <string>
+ #include <array>
+ #include <ros/ros.h>
+ #include <cv_bridge/cv_bridge.h>
+ #include <sensor_msgs/Image.h>
+ #include <geometry_msgs/Vector3.h>
+ #include <image_transport/image_transport.h>
+ #include <camera_info_manager/camera_info_manager.h>
+ #include "Image.h"
+ #include"Yolov8_Fan.h"
+ #include"Yolov8_R.h"
+ #include "rm_msgs/RmSerial.h"
+#include <std_msgs/Float64.h>
+
+ // 调试
+////////////////////////////
+#include <chrono>
+#include <thread>
+////////////////////////////
+
+using namespace cv;
+using namespace std;
+
+
+rm_msgs::RmSerial RmSerialData;
+/////////////////////////////////////////////////////////////////////////
+// 模型路径通过 ROS param 配置, 默认从工作空间 Model/fu_moxi/ 加载
+// roslaunch 可覆盖: <param name="r_model_path" value="/absolute/path/to/R_best.onnx"/>
+YOLOV8_R*   yolofumodel   = nullptr;
+YOLOV8_Fan* yoloFanmodel  = nullptr;
+vector<R_Detection>   result_R;
+vector<Fan_Detection>  result_Fan;
+
+//重要参数
+char camp = 'r';//阵营
+std::string MoveMode = "small";//小符
+// std::string MoveMode = "big";//大符
+#define R_maxRadius 1.35//外圆比例
+#define R_minRadius 0.78//0.78//内圆比例
+double fps = 30;
+
+//阈值 (恢复原始稳定值)
+//赛_blue1_4_29
+#define B_LH 0
+#define B_LS 0
+#define B_LV 115
+#define B_UH 255
+#define B_US 254
+#define B_UV 255
+#define kernelData 7
+//基地_red_4 — 红色包裹0度, 双区间但保持原V阈值
+#define R_LH_LOW  0
+#define R_LS_LOW  0
+#define R_LV_LOW  176
+#define R_UH_LOW  7
+#define R_US_LOW  255
+#define R_UV_LOW  255
+#define R_LH_HIGH 170
+#define R_LS_HIGH 0
+#define R_LV_HIGH 176
+#define R_UH_HIGH 180
+#define R_US_HIGH 255
+#define R_UV_HIGH 255
+
+/////////////////////////////////////////////////////////////////////////
+//比较函数
+bool cmp(int a,int b)
+{
+    return a>b;
+}
+/////////////////////////////////////////////////////////////////////////
+class identifies //识别器
+{
+public:
+    cv::Mat frame_R; // 用于识别R
+    cv::Mat frame_Fan; // 用于识别Fan
+
+    double Radius = 0; // 半径
+    vector<float> R_score_container; // 中心R置信度容器
+    cv::Rect R_box; // 检测中心R识别结果是否合理
+    cv::Rect Yolov8_R_Box; // 储存最终中心R识别结果
+    vector<cv::Rect> Fan_box; // 检测扇页识别结果是否合理
+    int maxWhitePixels = 0; // 最多白色像素数量
+    double side =0;//最终边长
+    cv::Point2f final_Fan_Box_center = {0, 0};//识别结果的中心(未矫正)
+    int final_Fan_Box_x =0;//最终坐标x
+    int final_Fan_Box_y =0;//最终坐标y
+    cv::Rect final_Fan_Box; // 白色像素最多的矩形框(最终的扇页矩形)
+    cv::Point2f center_R_Box; // 中心R中心
+    cv::Point2f center_Fan_Box; // 扇页中心
+    vector<cv::Point2f> center; // 用于返回center_R_Box和center_Fan_Box；
+
+    // === 防误识别/防抖新增成员 ===
+    int last_quadrant = -1;          // 上一帧扇叶象限 0:左上 1:右上 2:左下 3:右下
+    int quadrant_stable_cnt = 0;     // 连续同象限计数(滞回用)
+    int active_quadrant = -1;        // 当前稳定象限(滞回锁定后)
+    cv::Point2f last_valid_center_Fan; // 上一帧有效扇叶中心(时序一致性用)
+    cv::Point2f last_valid_center_R;   // 上一帧有效R中心
+    bool has_prev_valid = false;       // 是否有历史有效结果
+    int consecutive_fail = 0;          // 连续失败帧数
+
+
+    // 构造函数用于初始化半径
+    identifies(cv::Point2f center_R, // 中心R中心
+               cv::Point2f center_Fan, // 扇页中心
+               double side_Fan)
+        : center_R_Box(center_R), // 初始化
+          center_Fan_Box(center_Fan) {
+        Radius = std::sqrt(std::pow((center_Fan_Box.x - center_R_Box.x), 2) + std::pow((center_Fan_Box.y - center_R_Box.y), 2));
+        side = side_Fan;
+    }
+
+    // 识别中心R
+
+//identifies_R(frame)
+//├─ 记录起始时间，YOLO推理检测R，打印推理耗时
+//├─ 无检测框 → 打印提示，return false
+//└─ 存在检测框
+//   ├─ 遍历筛选类别0、画面内有效R，收集置信度
+//   ├─ 置信度降序排序，匹配最高分保存最优R矩形
+//   ├─ 计算R中心点
+//  └─ return true
+    bool identifies_R(cv::Mat &frame) {
+        result_R = yolofumodel->detect(frame);
+        if (result_R.empty()) {
+            return false;
+        }
+
+        // 收集有效 R 检测 (class_id==0, 在画面内, 置信度>0.3)
+        R_score_container.clear();
+        std::vector<int> valid_idx;
+        for (int i = 0; i < (int)result_R.size(); i++) {
+            if (result_R[i].class_id == 0) {
+                const auto& b = result_R[i].box;
+                if (b.x < 0 || b.y < 0 || b.x + b.width  > frame.cols || b.y + b.height > frame.rows)
+                    continue;
+                if (result_R[i].confidence < 0.3f)  // 降低阈值, 但保留基本过滤
+                    continue;
+                R_score_container.push_back(result_R[i].confidence);
+                valid_idx.push_back(i);
+            }
+        }
+        if (R_score_container.empty()) {
+            return false;
+        }
+
+        // 取最高置信度
+        auto max_it = std::max_element(R_score_container.begin(), R_score_container.end());
+        int best_i = valid_idx[std::distance(R_score_container.begin(), max_it)];
+
+        cv::Rect raw = result_R[best_i].box;
+        cv::Rect smooth_box(raw.x, raw.y, raw.width, raw.height);
+
+        // EMA 平滑: 抑制逐帧抖动 (alpha=0.25, 稳定优先)
+        static cv::Rect prev_box;
+        static bool has_prev = false;
+        if (has_prev && prev_box.width > 0) {
+            const float alpha = 0.25f;  // 平滑系数
+            smooth_box.x      = (int)(alpha * raw.x      + (1.f - alpha) * prev_box.x);
+            smooth_box.y      = (int)(alpha * raw.y      + (1.f - alpha) * prev_box.y);
+            smooth_box.width  = (int)(alpha * raw.width  + (1.f - alpha) * prev_box.width);
+            smooth_box.height = (int)(alpha * raw.height + (1.f - alpha) * prev_box.height);
+        }
+        prev_box = smooth_box;
+        has_prev = true;
+
+        Yolov8_R_Box = smooth_box;
+        center_R_Box = {Yolov8_R_Box.x + Yolov8_R_Box.width / 2.0f,
+                        Yolov8_R_Box.y + Yolov8_R_Box.height / 2.0f};
+        R_score_container.clear();
+        return true;
+    }
+
+    //identifies_Fan(frame)
+    //├─ 生成环形掩码，仅保留R外圈圆环
+    //├─ BGR转HSV，红蓝阵营分别阈值二值化
+    //├─ 形态学闭操作消除噪点
+    //├─ findContours提取轮廓，生成外接矩形；无轮廓直接返回false
+    //├─ 过滤尺寸过小矩形，选白色像素最多的色块作为扇叶
+    //├─ 无有效扇叶返回false，清空临时容器
+    //├─ 根据扇叶相对R的方位校正坐标，统一为标准正方形框
+    //├─ 计算扇叶中心点
+    //└─ return true
+
+    // 识别扇页
+    bool identifies_Fan(cv::Mat &frame) {
+        /*做同心圆掩码 — 恢复使用EMA平滑后的R中心, 保证掩码稳定不抖 */
+        cv::Mat blackImage = Mat::zeros(frame.size(), frame.type());
+        circle(blackImage, center_R_Box, static_cast<int>(Radius * R_maxRadius), Scalar(255, 255, 255), -1);
+        bitwise_and(frame, blackImage, frame);
+        circle(frame, center_R_Box, static_cast<int>(Radius * R_minRadius), cv::Scalar(0, 0, 0), -1, LINE_AA); // 内圆
+
+        /*图像处理*/
+        // 转换色彩空间为hsv并阈值化
+        cvtColor(frame, frame, COLOR_BGR2HSV);
+        if (camp == 'r') { // 红色双区间 (包裹0度, 保持原V阈值)
+            cv::Mat mask1, mask2;
+            inRange(frame, Scalar(R_LH_LOW, R_LS_LOW, R_LV_LOW), Scalar(R_UH_LOW, R_US_LOW, R_UV_LOW), mask1);
+            inRange(frame, Scalar(R_LH_HIGH, R_LS_HIGH, R_LV_HIGH), Scalar(R_UH_HIGH, R_US_HIGH, R_UV_HIGH), mask2);
+            frame = mask1 | mask2;
+        } else if (camp == 'b') {
+            inRange(frame, Scalar(B_LH, B_LS, B_LV), Scalar(B_UH, B_US, B_UV), frame);
+        } else {
+            inRange(frame, Scalar(B_LH, B_LS, B_LV), Scalar(B_UH, B_US, B_UV), frame);
+        }
+        imshow("掩码", frame);
+
+        // 形态学闭操作(先膨胀再腐蚀)
+        cv::Mat element = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(15, 13));
+        cv::morphologyEx(frame, frame, cv::MORPH_CLOSE, element); // 形态学闭操作
+
+        // 获得连续轮廓及其矩形
+        std::vector<std::vector<cv::Point>> contours;
+        std::vector<cv::Vec4i> hierarchy;
+        cv::findContours(frame, contours, hierarchy, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);//1. findContours 提取图像全部外层轮廓
+        for (size_t i = 0; i < contours.size(); i++) {
+            Fan_box.push_back(cv::boundingRect(contours[i])); 
+            //遍历所有轮廓，boundingRect得到每个轮廓外接矩形存入Fan_box
+            //cout << "连续轮廓数量：" << contours.size() << endl;
+        }
+        if (contours.empty()) { // 异常检测
+            return false;
+        }
+
+        /*筛选扇页(选择白色像素点最多的目标为打击目标)*/
+        maxWhitePixels = 0; // 清除最大白色像素数量
+        final_Fan_Box = cv::Rect(0, 0, 0, 0);
+        for (const auto& rect : Fan_box) {
+            if (rect.width < Yolov8_R_Box.width * 2.1 || rect.height < Yolov8_R_Box.height * 2.1) {
+                continue;
+            }
+            // 边界保护: clamp rect 到图像范围内, 防止 frame(rect) 崩溃
+            cv::Rect safe_rect = rect;
+            safe_rect.x      = std::max(0, std::min(safe_rect.x, frame.cols - 1));
+            safe_rect.y      = std::max(0, std::min(safe_rect.y, frame.rows - 1));
+            safe_rect.width  = std::min(safe_rect.width,  frame.cols - safe_rect.x);
+            safe_rect.height = std::min(safe_rect.height, frame.rows - safe_rect.y);
+            if (safe_rect.width <= 0 || safe_rect.height <= 0) continue;
+
+            cv::Mat roi = frame(safe_rect);
+            int whitePixels = cv::countNonZero(roi);
+            if (whitePixels > maxWhitePixels) {
+                maxWhitePixels = whitePixels;
+                final_Fan_Box = safe_rect;
+            }
+        }
+
+        // 检查矩形是否为空（即宽度或高度为0）
+        if (final_Fan_Box.width == 0 || final_Fan_Box.height == 0) {
+            // 矩形为空
+            return false;
+        }
+
+        // === 形状校验: 过滤非扇叶噪点 (收紧参数, 避免圆形靶标误检) ===
+        {
+            float aspect = (float)final_Fan_Box.width / (float)final_Fan_Box.height;
+            // 扇叶近似正方形, 长宽比收紧到 0.6~1.7
+            if (aspect < 0.6f || aspect > 1.7f) {
+                return false;
+            }
+            // 填充率: 实心扇叶二值化后应有较高填充
+            float fill_ratio = (float)maxWhitePixels / (float)(final_Fan_Box.width * final_Fan_Box.height);
+            if (fill_ratio < 0.25f) {
+                return false;
+            }
+        }
+
+        //清除临时扇页矩形框
+        Fan_box.clear();
+
+        //根据中心R的大小动态计算扇页大小 (EMA平滑)
+        static double smooth_side = 0;
+        double dynamic_side = Yolov8_R_Box.width * 3.5;
+        if (smooth_side > 0) {
+            smooth_side = 0.25 * dynamic_side + 0.75 * smooth_side;  // EMA
+        } else {
+            smooth_side = dynamic_side;
+        }
+        dynamic_side = smooth_side;
+
+        //计算识别结果矩形中心
+        final_Fan_Box_center.x = final_Fan_Box.x + final_Fan_Box.width*0.5;
+        final_Fan_Box_center.y = final_Fan_Box.y + final_Fan_Box.height*0.5;
+
+        // === 象限判定 + 滞回: 需要连续3帧同象限才切换, 防止边界抖动 ===
+        int raw_quadrant;
+        if (final_Fan_Box_center.y <= center_R_Box.y) {
+            raw_quadrant = (final_Fan_Box_center.x < center_R_Box.x) ? 0 : 1; // 0:左上 1:右上
+        } else {
+            raw_quadrant = (final_Fan_Box_center.x < center_R_Box.x) ? 2 : 3; // 2:左下 3:右下
+        }
+
+        if (raw_quadrant == last_quadrant) {
+            quadrant_stable_cnt++;
+        } else {
+            quadrant_stable_cnt = 1;
+        }
+        last_quadrant = raw_quadrant;
+
+        // 连续3帧同象限才更新active_quadrant
+        if (quadrant_stable_cnt >= 3 || active_quadrant == -1) {
+            active_quadrant = raw_quadrant;
+        }
+
+        // 根据稳定象限归一化扇叶框
+        switch (active_quadrant) {
+            case 0: // 左上
+                final_Fan_Box_x = final_Fan_Box.x;
+                final_Fan_Box_y = final_Fan_Box.y;
+                break;
+            case 1: // 右上
+                final_Fan_Box_x = final_Fan_Box.x + final_Fan_Box.width - dynamic_side;
+                final_Fan_Box_y = final_Fan_Box.y;
+                break;
+            case 2: // 左下
+                final_Fan_Box_x = final_Fan_Box.x;
+                final_Fan_Box_y = final_Fan_Box.y + final_Fan_Box.height - dynamic_side;
+                break;
+            case 3: // 右下
+                final_Fan_Box_x = final_Fan_Box.x + final_Fan_Box.width - dynamic_side;
+                final_Fan_Box_y = final_Fan_Box.y + final_Fan_Box.height - dynamic_side;
+                break;
+        }
+
+        //最终扇页
+        final_Fan_Box = cv::Rect(final_Fan_Box_x, final_Fan_Box_y, dynamic_side, dynamic_side);
+        /*获得扇页中心*/
+        center_Fan_Box = {final_Fan_Box.x + final_Fan_Box.width / 2.0f, final_Fan_Box.y + final_Fan_Box.height / 2.0f};
+        
+        return true;
+    }
+
+    // 可视化
+    // 可视化
+    void visual(cv::Mat frame) {// 画矩形
+    rectangle(frame, final_Fan_Box, Scalar(0, 255, 0), 2);
+    rectangle(frame, Yolov8_R_Box, Scalar(0, 255, 0), 2);
+
+    // ========== 新增：打印R、扇叶原始像素坐标 ==========
+    char buf[128];
+    // 中心R坐标
+    sprintf(buf, "R X:%d Y:%d", (int)center_R_Box.x, (int)center_R_Box.y);
+    cv::putText(frame, buf, cv::Point(15, 30), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 255), 2);
+    // 扇叶坐标
+    sprintf(buf, "Fan X:%d Y:%d", (int)center_Fan_Box.x, (int)center_Fan_Box.y);
+    cv::putText(frame, buf, cv::Point(15, 60), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+
+    // 画出两个中心点
+    cv::circle(frame, center_R_Box, 4, Scalar(0,0,255), -1);
+    cv::circle(frame, center_Fan_Box, 4, Scalar(0,255,0), -1);
+
+    imshow("矩形框可视化", frame);
+}
+
+
+    // 综合识别函数
+    vector<cv::Point2f> Identifies(cv::Mat &frame) {
+        frame_R = frame.clone(); // 复制图像
+        frame_Fan = frame.clone();
+        center.clear(); // 清除中心储存容器
+        std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();//首时间
+
+        bool r_ok = identifies_R(frame_R);
+        bool fan_ok = r_ok && identifies_Fan(frame_Fan);
+
+        if (r_ok && fan_ok) {
+            // === 时序一致性校验: 扇叶/R中心位移不应超过物理极限 ===
+            if (has_prev_valid) {
+                float dist_fan = cv::norm(center_Fan_Box - last_valid_center_Fan);
+                float dist_r   = cv::norm(center_R_Box   - last_valid_center_R);
+                // 大符~10rad/s, 半径~200px, 帧间位移上限≈200*10/30≈67px, 取1.5倍安全系数
+                float max_fan_move = Radius * 0.55f;
+                float max_r_move   = Radius * 0.35f;
+
+                if (dist_fan > max_fan_move || dist_r > max_r_move) {
+                    // 跳变超限 → 拒绝, 复用上次有效结果
+                    center.push_back(last_valid_center_R);
+                    center.push_back(last_valid_center_Fan);
+                    consecutive_fail = 0;
+                } else {
+                    // 正常 → 更新历史
+                    center.push_back(center_R_Box);
+                    center.push_back(center_Fan_Box);
+                    last_valid_center_R   = center_R_Box;
+                    last_valid_center_Fan = center_Fan_Box;
+                    consecutive_fail = 0;
+                }
+            } else {
+                // 首次有效结果
+                center.push_back(center_R_Box);
+                center.push_back(center_Fan_Box);
+                last_valid_center_R   = center_R_Box;
+                last_valid_center_Fan = center_Fan_Box;
+                has_prev_valid = true;
+                consecutive_fail = 0;
+            }
+            visual(frame);
+        } else {
+            // === 失败回退: 连续≤5帧丢帧时复用上次有效结果 ===
+            consecutive_fail++;
+            if (has_prev_valid && consecutive_fail <= 5) {
+                center.push_back(last_valid_center_R);
+                center.push_back(last_valid_center_Fan);
+            } else if (consecutive_fail > 5) {
+                // 超过5帧连续失败 → 真正丢失目标
+                has_prev_valid = false;
+                consecutive_fail = 0;
+            }
+            // center为空 → 外部判空处理
+        }
+        return center; // 返回成功的结果
+    }
+
+private:
+
+};
+
+
+class buff_predicted//预测器
+//基于 FFT（快速傅里叶变换），从角度时序数据里算出能量机关的旋转频率，用于运动周期预测、提前瞄准。
+
+{
+public:
+//计算原始角度数据的估计频率
+double findFrequency(const std::vector<double>& data, double sampleRate) {
+    int N = data.size();// 获取输入数据的大小
+
+    fftw_complex *in, *out;// 分配内存以存储FFT的输入和输出数据
+    fftw_plan p;
+
+    in = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);// 使用fftw_malloc分配内存
+    out = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * N);
+
+    p = fftw_plan_dft_1d(N, in, out, FFTW_FORWARD, FFTW_ESTIMATE);// 创建一个FFT计划，指定数据大小、输入输出数组、FFT方向和计划优化方式
+
+    for (int i = 0; i < N; ++i) {    // 填充输入数组，将实部数据赋值给输入数组，虚部设置为0
+        in[i][0] = data[i]; // 实部
+        in[i][1] = 0;       // 虚部
+    }
+
+    fftw_execute(p);// 执行FFT计划
+
+    double maxMagnitude = 0;// 初始化最大幅度和对应的索引
+    int maxIndex = 0;
+
+    for (int i = 1; i < N/2; ++i) {// 遍历FFT的输出数据，找到最大幅度的频率分量（避免直流分量）
+        double magnitude = sqrt(out[i][0]*out[i][0] + out[i][1]*out[i][1]);
+        if (magnitude > maxMagnitude) {
+            maxMagnitude = magnitude;
+            maxIndex = i;
+        }
+    }
+
+    double frequency = (double)maxIndex * sampleRate / N;    // 根据最大幅度的索引和采样率计算频率
+
+    fftw_destroy_plan(p);    // 清理资源，销毁FFT计划并释放内存
+    fftw_free(in);
+    fftw_free(out);
+
+    return frequency;// 返回计算出的频率
+}
+
+//计算原始角度数据的平均值
+template<typename T>
+T mean(vector<T>data){
+    T sum = 0;
+    for(T t : data)
+        sum += t;
+    return sum / data.size();
+}
+
+// 定义一个模板函数，用于计算余弦模型的值
+template<typename T>
+static T func(T x, T a, T omega, T phi, T level){
+    return a * ceres::cos(omega * x + phi) + level;
+}
+
+//定义一个模板反函数，用于计算余
+//用 inverse_func 反算每个角度对应的相位
+template<typename T>
+T inverse_func(const T y, const T a, const T level) {
+    // 确保 a 不为0，避免除以0的错误
+    if (a == 0) {
+        throw std::invalid_argument("Amplitude 'a' cannot be zero.");
+    }
+    
+    // 确保 y - level 的值在 [-a, a] 范围内，因为 arccos 的范围是 [0, PI]
+    T cos_value = (y - level) / a;
+    if (cos_value > 1) {
+        //throw std::out_of_range("The value of (y - level) / a must be within [-1, 1].");
+        return 0;
+    }else if (cos_value < -1){
+        //throw std::out_of_range("The value of (y - level) / a must be within [-1, 1].");
+        return PI;
+    }
+    
+    // 计算反函数
+    return std::acos(cos_value);//std::acos 函数返回的值在 [0,  PI] 范围内，第二个结果只能手动加负号
+}
+
+// 定义一个用于正弦拟合的CostFunction结构体
+struct SineModel {
+    // 6B
+    //接收并存储一个观测数据点的坐标 (x, y)，其中：
+
+    //x：自变量（通常是时间、角度等）
+
+    //y：因变量（观测到的实际值）       
+    SineModel(double x, double y) : x_(x), y_(y) {}
+
+    // 模板函数，用于计算残差
+    template <typename T> bool operator()(
+        const T* const a,       // 振幅参数a的指针
+        const T* const omega,   // 角频率参数omega的指针
+        const T* const phi,     // 相位参数phi的指针
+        const T* const level,   // 基线值level的指针
+        T* residual              // 用于存储残差的数组
+    ) const {
+        // 计算模型预测值y_ - func<T>与实际观测值y_之间的残差
+        residual[0] = (T(x_), a[0], omega[0], phi[0], level[0]);
+        return true;
+        //预测角度 = 振幅 * cos(ω * 时间 + 相位) + 平均角度
+    }
+
+private:
+    const double x_;  // 存储x值的常量成员变量
+    const double y_;  // 存储y值的常量成员变量
+};
+
+//让视觉识别出的目标运动轨迹变得平滑连续，消除噪声导致的抖动，从而提升云台瞄准的稳定性和打击精度。
+//滑动窗口法平滑角度数据
+template<typename T>
+//对连续数据进行平滑处理，去除高频随机噪声，同时保留信号的总体趋势。
+std::vector<T> moving_average(const std::vector<T>& data, size_t window_size) {
+    // 检查窗口大小是否有效
+    if (window_size <= 0) {
+        throw std::invalid_argument("窗口大小必须是一个正整数。");
+    }
+    if (window_size > data.size()) {
+        throw std::invalid_argument("窗口大小不能大于数据长度。");
+    }
+    if (data.empty()) {
+        throw std::invalid_argument("数据不能为空。");
+    }
+
+    std::vector<T> averaged_data;
+    //提前给向量开辟足够的内存空间，避免频繁扩容，让程序更快、更稳定。
+    //分配内存
+    //用push_back方法向向量末尾添加元素时，如果当前容量不足以容纳新元素，向量会自动扩容。扩容通常涉及分配新的内存空间、复制现有元素到新空间，并释放旧空间。这些操作会导致性能下降，尤其是在大量数据的情况下。
+    averaged_data.reserve(data.size() - window_size + 1);
+
+    // 使用 std::accumulate 计算第一个窗口的总和
+    //T{0} = 创建一个类型为 T、值为 0 的临时对象
+
+    //作用：作为 std::accumulate 的初始值，确保累加器的类型是 T
+    T sum = std::accumulate(data.begin(), data.begin() + window_size, T{0});
+    averaged_data.push_back(sum / window_size);
+
+    // 遍历数据，更新窗口内的数据总和，并计算新的平均值
+    for (size_t i = window_size; i < data.size(); ++i) {
+        sum += data[i] - data[i - window_size];
+        averaged_data.push_back(sum / window_size);
+    }
+
+    return averaged_data;
+}
+
+    //预测函数（delta_angle_data为差分角，要求经过了异常处理，只包含纯合理的差分角。angle_time_data为每个差分角对应的时间。MoveMode为打击目标标识符，即大小符。delta_t为差分时间。fps为帧率）
+    double predicted(const std::vector<double>& delta_angle_data, const std::vector<double>& angle_time_data,std::string &MoveMode,const double &delta_t,const double &fps)
+    {
+            //判断数据是否正常，不正常则返回零
+            if (delta_angle_data.size() < 2 || angle_time_data.size() < 2 ||
+                MoveMode.empty() || delta_t <= 0 || fps <= 0){
+                return 0;
+            }
+        //判断大小fu
+        if(delta_angle_data.size()  ==  static_cast<int>(fps*PI)){
+                //初始化定值函数的参数（函数取值范围的均值）
+                double const_level_ = 1.1775 * delta_t;//平移
+                double const_omega_ = 1.924;//角速度
+                double const_a_ = (2 * (2.090 - const_level/delta_t) * sin(const_omega * delta_t / 2)) / const_omega;//振幅
+                //过滤异常值
+                vector<double> delta_angle_filter;
+                for (int i = 1; i < delta_angle_data.size(); i++)
+                {
+                    //除去突变差分角(角度相邻间隔不超过2.5度)
+                    if (abs(delta_angle_data[i] - delta_angle_data[i-1]) < PI*0.014){
+                        delta_angle_filter.push_back(delta_angle_data[i]);
+                    }
+                }
+                //平滑数据
+                //对滤波后的角度数据做滑动平均降噪，再通过计算数据波动幅度（估算正弦振幅），判断当前能量机关是大机关（大风车） 还是小机关，切换运动模式。
+                vector<double> moving_average_angle_data_;
+                if (delta_angle_filter.size() >= 7) { moving_average_angle_data_ = moving_average(delta_angle_filter, 7); } else if (!delta_angle_filter.empty()) { moving_average_angle_data_ = delta_angle_filter; }//滑动窗口大小为7
+            double a_ =(*max_element(moving_average_angle_data_.begin(), moving_average_angle_data_.end()) - *min_element(moving_average_angle_data_.begin(), moving_average_angle_data_.end()))/2;//估计数据振幅
+            if(a_ > const_a_*0.5){
+                MoveMode = "big";
+            }else{
+                MoveMode = "small";
+            }
+        }
+        //判断是大符还是小符
+        if (MoveMode == "big")//大符预测
+        {
+            //初始化要带入方程的参数
+            if (init_a_omega_level){//init_a_omega_level等于true即未初始化，反之为已初始化
+            
+                //检查数据是否足够判断大符的顺逆 （角速度为负（通常定义逆时针为正））,判断顺逆用于初始化level
+                if (delta_angle_data.size() < 6){
+                    return 0;
+                }
+
+                //初始化定值函数的参数（函数取值范围的均值）
+                const_level = 1.1775 * delta_t;//平移
+                const_omega = 1.924;//角速度
+                const_a = (2 * (2.090 - const_level/delta_t) * sin(const_omega * delta_t / 2)) / const_omega;//振幅
+
+                //求平均数，只取5个值的平均
+                double average_ = 0;
+                double sum_ = 0;
+                for (int i = 1; i <= delta_angle_data.size(); i++){
+                    sum_ = sum_ + (delta_angle_data[delta_angle_data.size() - i]) * 1000;
+                }
+                average_ = sum_ / delta_angle_data.size();
+ 
+                //初始化要带入方程的参数为定植参数
+                a = const_a;
+                omega = const_omega;
+                //判断大符旋转方向（平均值大于零为逆时针，反之则反）
+                if (average_ > 0){
+                    level = const_level;//顺时针
+                    big_rotate_state = true;//true顺，反则反
+                }else{
+                    level = -const_level;//逆时针
+                    big_rotate_state = false;//false逆，反则反
+                }
+
+                //初始化用于优化的数据数量
+                ceres_data_count = static_cast<int>(fps*PI) * 2;
+                
+                //初始标识符
+                init_a_omega_level = false;
+            }
+
+
+            //如果符合条件则优化
+            //这段代码是Ceres 优化器的触发条件，
+            //作用是当收集到的历史数据达到预设数量时，启动一次非线性优化，精确拟合正弦运动模型的参数。
+            if (!seres_stop && delta_angle_data.size()  ==  ceres_data_count)
+            {
+                std::chrono::steady_clock::time_point ceres_start = std::chrono::steady_clock::now();//优化首时间
+
+                //过滤异常值
+                vector<double> delta_angle_filter;
+                int remove_date_mub = 0;
+                for (int i = 1; i < delta_angle_data.size(); i++)
+                {
+                    //除去突变差分角(角度相邻间隔不超过2.5度)
+                    if (abs(delta_angle_data[i] - delta_angle_data[i-1]) < PI*0.014){
+                        delta_angle_filter.push_back(delta_angle_data[i]);
+                    }else{
+                        remove_date_mub++;
+                    }
+                }
+
+                //平滑数据
+                moving_average_angle_data.clear();
+                if (delta_angle_filter.size() >= 7) { moving_average_angle_data = moving_average(delta_angle_filter, 7); } else if (!delta_angle_filter.empty()) { moving_average_angle_data = delta_angle_filter; }//滑动窗口大小为7
+
+                //估计参数
+                //计算振幅、基线、周期等运动参数
+
+                int maxIndex = 0;
+                int minIndex = 0;
+
+                for (size_t i = 1; i < moving_average_angle_data.size(); ++i) {
+                    if (moving_average_angle_data[i] > moving_average_angle_data[maxIndex]) {
+                        maxIndex = i;
+                    }
+                    if (moving_average_angle_data[i] < moving_average_angle_data[minIndex]) {
+                        minIndex = i;
+                    }
+                }
+                // 获得两极值之间相差的时间
+                double extreme_time_interval = std::abs(angle_time_data[maxIndex] - angle_time_data[minIndex])*0.001 + (remove_date_mub)/(2*fps);
+                cout << "最大值下标:" << maxIndex << endl;
+                cout << "最小值下标:" << minIndex << endl;
+                cout << "获得两极值之间相差的时间:" << extreme_time_interval << endl;
+
+
+                double sampleRate = delta_angle_filter.size()/(PI*1.5);//采样率（用于估计频率）
+                double estimatedFrequency = findFrequency(moving_average_angle_data, sampleRate);//估计数据频率
+                a =(*max_element(moving_average_angle_data.begin(), moving_average_angle_data.end()) - *min_element(moving_average_angle_data.begin(), moving_average_angle_data.end()))/2;//估计数据振幅
+                a_temp = a;//保留原始数据的振幅
+                // omega = estimatedFrequency*2*PI;//估计数据角速度
+                omega = PI/extreme_time_interval;
+                double omega_temp = omega;//保留原始数据的角速度
+                double phi = 0.75;//估计初相位
+                level = (*max_element(moving_average_angle_data.begin(), moving_average_angle_data.end()) + *min_element(moving_average_angle_data.begin(), moving_average_angle_data.end()))/2;;//估计平移
+                double level_temp = level;//保留原始数据的基线
+
+                //转换时间单位为秒
+                std::vector<double> angle_time_data_;
+                for (int i = 0; i < moving_average_angle_data.size(); i++){
+                    angle_time_data_.push_back(moving_average_angle_data[i]/1000);
+                }
+
+                /*初始化优化器*/
+                //整体作用：为正弦曲线拟合，创建 Ceres 自动求导的代价函数，用于求解最优模型参数。
+                ceres::Problem problem;//设置问题
+                for (int i = 0; i < moving_average_angle_data.size(); ++i) {
+                    //<SineModel, 残差数=1, 参数1维度=1, 参数2维度=1, 参数3维度=1, 参数4维度=1>
+                    ceres::CostFunction* cost_function = new ceres::AutoDiffCostFunction<SineModel, 1, 1, 1, 1, 1>(//用来算「观测角度 - 模型预测角度」的误差。
+                            new SineModel(angle_time_data_[i], moving_average_angle_data[i])
+                    );
+                    problem.AddResidualBlock(cost_function, nullptr, &a, &omega, &phi, &level);
+                }
+                // 设置优化选项(更改可提升速度)
+                ceres::Solver::Options options;
+                options.preconditioner_type = ceres::JACOBI;
+                options.max_num_iterations = 500;
+                options.function_tolerance = 1e-15;
+                options.gradient_tolerance = 1e-15;
+                options.parameter_tolerance = 1e-15;
+                options.minimizer_type = ceres::TRUST_REGION;
+                options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+                options.linear_solver_type = ceres::DENSE_QR;
+                options.num_threads = 2;
+                //options.minimizer_progress_to_stdout = true;//日志记录输出
+                /*  优化参数说明
+                    options.preconditioner_type = ceres::JACOBI; 默认值ceres::JACOBI，预处理器。
+                    function_tolerance：默认值是1e-6，表示目标函数值的变化小于这个值时优化停止。
+                    gradient_tolerance：默认值是1e-10，表示目标函数的梯度（即雅可比矩阵的最大值）小于这个值时优化停止。
+                    parameter_tolerance：默认值是1e-8，表示参数的变化量小于这个值时优化停止。
+                    max_num_iterations：默认值是50，表示最大迭代次数。
+                    initial_trust_region_radius：默认值是1e4，表示初始信任域的大小。
+                    max_trust_region_radius：默认值是1e16，表示信任域的最大大小。
+                    min_trust_region_radius：默认值是1e-32，表示信任域的最小大小。
+                    min_relative_decrease：默认值是1e-3，表示每次迭代中目标函数值的相对减少量。
+                    max_num_consecutive_invalid_steps：默认值是5，表示连续无效步长的最大次数。
+                    num_threads：默认值是1，表示使用的线程数。
+                */
+
+                // 运行优化
+                ceres::Solver::Summary summary;
+                ceres::Solve(options, &problem, &summary);
+
+                // 打印优化结果
+                std::cout << "完整优化报告———————" << summary.FullReport() << std::endl;
+                std::cout << "优化结果——————\n";
+                //std::cout << "频率估计： " << estimatedFrequency << "\n";
+                std::cout << "a, omega, phi, level: " << a << ", " << omega << ", "  << phi << ", " << level << "\n";
+
+                // //将结果图像化
+                // vector<double>y;
+                // for(int i = 0; i < data2.size(); i++){
+                //     y.emplace_back(func<double>(i, a, omega, phi, level));
+                // }
+                // plotScatter(_time, y, "Fitted data", "time", "y");
+
+                // plt::show();
+
+                //判断优化得出的参数是否合理可使用(优先采用平移)
+                max_level = 1.310 * delta_t;//最大平移
+                max_omega = 2.000;//最大角速度
+                max_a = (2 * (2.090 - 1.045) * sin(max_omega * delta_t / 2)) / max_omega;//最大振幅
+                min_level = 1.045 * delta_t;//最小平移
+                min_omega = 1.884;//最小角速度
+                min_a = (2 * (2.090 - 1.310) * sin(min_omega * delta_t / 2)) / min_omega;//最小振幅
+
+                //打印范围
+                cout << "max_level:" << max_level << endl;
+                cout << "max_omega:" << max_omega << endl;
+                cout << "max_a:" << max_a << endl;
+                cout << "min_level:" << min_level << endl;
+                cout << "min_omega:" << min_omega << endl;
+                cout << "min_a:" << min_a << endl;
+
+                //打印定值参数
+                cout << "--------------------" << endl;
+                cout << "const_level:" << const_level << endl;
+                cout << "const_omega:" << const_omega << endl;
+                cout << "const_a:" << const_a << endl;
+
+                //判断拟合数据是否合理
+                //最先判断相位omega(omega将其视为正值，因为它不影响角度计算)
+                if (omega > 0){
+                    //不处理omega
+                }else{
+                    omega = -omega;
+                }
+                if (omega < min_omega ||  omega > max_omega){//判断相位
+                    omega = const_omega;//不符合则使用固定参数
+                }        
+
+                //a，将其视为正值，因为它不影响角度计算 
+                if (a > 0){
+                    //不处理a
+                }else{
+                    a = -a;
+                }
+    
+                //优先选择平移，其次振幅（level正表示大符逆时针旋转，反之则反）
+                if (level > min_level &&  level < max_level)//判断平移,正值逆时针
+                {
+                    a = (2 * (2.090 - level/delta_t) * sin(omega * delta_t / 2)) / omega;
+                    cout << "正基线合理"  << endl;
+
+                }else if (level < -min_level &&  level > -max_level)//判断平移,负值顺时针
+                {
+                    a = (2 * (2.090 + level/delta_t) * sin(omega * delta_t / 2)) / omega;
+                    cout << "负基线合理"  << endl;
+                }else if ((a > min_a &&  a < max_a) && big_rotate_state)//判断振幅
+                {
+                    level = (2.090 - (a*omega/(2*sin(omega * delta_t / 2)))) * delta_t;//level要根据拟合结果赋值
+                    cout << "振幅合理，基线不合理" << endl;
+                }else if ((a > min_a &&  a < max_a) && !big_rotate_state)//判断振幅
+                {
+                    level = -(2.090 - (a*omega/(2*sin(omega * delta_t / 2)))) * delta_t;//level要根据拟合结果赋值
+                    cout << "振幅合理，基线不合理" << endl;
+                }else{//两个都不符合则使用固定参数
+                    a = const_a;
+                    if (big_rotate_state)//level要根据拟合结果赋值
+                    {
+                        level = const_level;
+                    }else{
+                        level = -const_level;
+                    }
+                    cout << "基线和振幅都不合理" << endl;
+                }
+///////////////////////////////////////////////////////
+                a = a_temp;//保留原始数据的振幅
+                // omega = omega_temp;//保留原始数据的角速度
+                omega = 2;//保留原始数据的角速度
+                level = level_temp;//保留原始数据的基线
+                cout << "估计的振幅：" << a << endl;
+                cout << "估计的角速度：" << omega << endl;
+                cout << "估计的基线：" << level << endl;
+///////////////////////////////////////////////////
+                //计算优化所用时间
+                std::chrono::steady_clock::time_point ceres_end = std::chrono::steady_clock::now();//优化末时间
+                std::chrono::steady_clock::duration ceres_time = ceres_end - ceres_start;//计算时间差
+                ceres_time_milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(ceres_time).count();//转换时间单位
+                //输出优化时间
+                std::cout << "优化时间: " << ceres_time_milliseconds << " 毫秒" << std::endl;
+
+            }else{
+                //如果不进行优化则清除优化时间计数（现在不使用）
+                ceres_time_milliseconds = 0;
+            }
+
+            //异常处理
+            //逆时针旋转差分角无负值，顺时针则反
+            if (big_rotate_state){//顺时针
+                if (delta_angle_data.back() < 0){
+                    cout << "异常：顺时针角度出现负的差分角" << endl;
+                    return 0;
+                }
+                
+            }else{//逆时针
+                if (delta_angle_data.back() > 0){
+                    cout << "异常：逆时针角度出现正的差分角" << endl;
+                    return 0;
+                } 
+            }
+            //除去突变差分角(差分角相邻间隔不超过2.5度)
+            if (abs(delta_angle_data.back() - delta_angle_data[delta_angle_data.size()-2]) > PI*0.014){
+                return 0;
+            }else{
+                filter_angle_data.push_back(delta_angle_data.back());
+            }
+
+            //初始化函数是上升期还是下降期（不是升就是降）
+            if (count_ == 0){
+                //判断函数是上升期还是下降期（不是升就是降）
+                if (filter_angle_data.size() < 21){//判断数据是否够数据进行识别
+                    bigbuff_state = true;//逆时针上升为1，反之为零。顺时针则反。
+                }else{
+                    moving_average_angle_data.clear();
+                    moving_average_angle_data = moving_average(filter_angle_data , 7);//滑动窗口大小为7
+
+                    bool flag_1 = (moving_average_angle_data[moving_average_angle_data.size() - 1] - moving_average_angle_data[moving_average_angle_data.size() - 5]) > 0;
+                    bool flag_2 = (moving_average_angle_data[moving_average_angle_data.size() - 1] - moving_average_angle_data[moving_average_angle_data.size() - 10]) > 0;
+                    bool flag_3 = (moving_average_angle_data[moving_average_angle_data.size() - 1] - moving_average_angle_data[moving_average_angle_data.size() - 15]) > 0;
+                    if ((flag_1 && flag_2) || (flag_1 && flag_3) || (flag_2 && flag_3))//三人表决，通过则为上升
+                    {
+                        bigbuff_state = true;//逆时针上升为1，反之为零。顺时针则反。
+                        cout << "上升" << endl;
+                    }else{
+                        bigbuff_state = false;//逆时针上升为1，反之为零。顺时针则反。
+                        cout << "下降" << endl;
+                    }
+
+                    count_ = static_cast<int>(fps*0.2);
+
+                }  
+            }else if (count_ == static_cast<int>(fps*0.2))//过极值点后
+            {
+                double specific_smoothed_date =(filter_angle_data[filter_angle_data.size() - int(fps * 0.10) - 0] + 
+                                                filter_angle_data[filter_angle_data.size() - int(fps * 0.10) - 1] + 
+                                                filter_angle_data[filter_angle_data.size() - int(fps * 0.10) - 2] + 
+                                                filter_angle_data[filter_angle_data.size() - int(fps * 0.10) - 3] + 
+                                                filter_angle_data[filter_angle_data.size() - int(fps * 0.10) - 4])/5;
+                if (filter_angle_data.back() - specific_smoothed_date < 0){
+                    // if (a < abs(filter_angle_data.back() - level) && abs(filter_angle_data.back() - level) < PI*0.28)//a不大于50度
+                    // {
+                    //     over_a++;
+                    // }else{
+                    //     over_a = 0;
+                    // }
+                    // if(over_a == 4){
+                    //     // a = abs(filter_angle_data.back() - level);
+                    //     over_a = 0;
+                    // }
+
+                    if (bigbuff_state){lag_count++;}else{lag_count = 0;}
+                    if (bigbuff_state && (lag_count >= static_cast<int>(fps*0.2)))
+                    {
+                        //a = abs(filter_angle_data[filter_angle_data.size() - int(fps * 0.07) - 2] - level);
+                        count_ = 1;
+                        bigbuff_state = false;//逆时针上升为true，反之为零。顺时针则反。
+                    }
+                    cout << "下降" << endl;
+                }else if(filter_angle_data.back() - specific_smoothed_date > 0){
+                    // if (a < abs(filter_angle_data.back() - level) && abs(filter_angle_data.back() - level) < PI*0.28)//a不大于50度
+                    // {
+                    //     over_a++;
+                    // }else{
+                    //     over_a = 0;
+                    // }
+                    // if(over_a == 4){
+                    //     // a = abs(filter_angle_data.back() - level);
+                    //     over_a = 0;
+                    // }
+
+                    if (!bigbuff_state){lag_count++;}else{lag_count = 0;}
+                    if (!bigbuff_state && (lag_count >= static_cast<int>(fps*0.2)))
+                    {
+                        //a = abs(filter_angle_data[filter_angle_data.size() - int(fps * 0.07) - 2] - level);
+                        count_ = 1;
+                        bigbuff_state = true;//逆时针上升为true，反之为零。顺时针则反。
+                    }
+                    cout << "上升" << endl;
+                }
+            }else{
+                count_++;
+            }
+        
+            if (filter_angle_data.empty()) return 0;
+            phase = std::abs(inverse_func(filter_angle_data.back(), a, level));//计算相位
+
+            //获得此刻相位（由于预测角的大小比较是比较绝对值，这是与顺逆有关的，所以根据level判断正负并处理相位）
+            if (bigbuff_state) {
+                phase = -phase; // 将数据带入反函数获得整个相位
+            } else {
+                phase = phase; // 将数据带入反函数获得整个相位，并取正
+            }
+            //cout << "此刻相位" << phase << endl;
+
+            if ((bigbuff_state && !predicted_rectify) ||(!bigbuff_state && predicted_rectify))
+            {
+            /*计算出最终角度*/
+            //cout << "此刻相位" << phase << endl;
+                predicted_phase = phase+delta_t*omega;//最终相位
+                predicted_angle = func(double(0), a, double(0),predicted_phase , level);//最终角度
+                // predicted_angle = 0.8727;//最终角度
+                predicted_rectify = bigbuff_state;
+                rectify_phase = predicted_phase;
+                rectify_time_index = angle_time_data.size()-1;
+            }else {
+                //计算出最终角度
+                //rectify_phase = std::abs(rectify_phase);
+                if (!angle_time_data.empty() && rectify_time_index < (int)angle_time_data.size())
+                    rectify_phase = rectify_phase+(angle_time_data.back()-angle_time_data[rectify_time_index])*0.001*omega;//最终相位
+                predicted_angle = func(double(0), a, double(0),rectify_phase , level);//最终角度
+                rectify_time_index = angle_time_data.size()-1;//获取当前做预测的下标
+                // cout << "omega:" << omega << endl;
+            }
+
+            // //打印预测角度和重要参数
+            // cout << "预测角度" << predicted_angle << endl;
+            // //cout << "预测相位" << predicted_phase << endl;
+            // cout << "a=" << a << endl;
+            // cout << "level=" << level << endl;
+            // cout << "omega=" << omega << endl;
+            // cout << "原始相位" << phase << endl;
+            // cout << "预测相位" << predicted_phase << endl;
+            // cout << "基础角度" << filter_angle_data.back() << endl;
+            // cout << "预测角度" << predicted_angle << endl;
+
+            // //储存预测角
+            // predicted_angle_data.push_back(predicted_angle);
+
+            //返回预测角
+            // return (predicted_angle+predicted_angle_data[predicted_angle_data.size()-2])*0.5;
+            return predicted_angle;         
+        }
+
+        if (MoveMode == "small")//小符
+        {
+            /*小符预测*/
+            if (init_a_omega_level)
+            {
+                cout << "小符初始化" << endl;
+                double average = 0;//角度数据的平均数
+
+                //求平均数，只取最近有效帧的平均 (>=10而非==10, 避免丢帧导致永远无法初始化)
+                if (delta_angle_data.size() >= 10){
+                    //过滤异常值
+                    vector<double> delta_angle_filter_;
+                    for (int i = 1; i < delta_angle_data.size(); i++)
+                    {
+                        //除去突变差分角(角度相邻间隔不超过5度)
+                        if (abs(delta_angle_data[i] - delta_angle_data[i-1]) < PI*0.028){
+                            delta_angle_filter_.push_back(delta_angle_data[i]);
+                        }
+                    }
+                    average = mean(delta_angle_filter_);
+                    delta_angle_filter_.clear();
+                }
+            
+                //判断小符旋转方向（平均值大于零为逆时针，反之则反）
+                {
+                    static int init_stuck_frames = 0;  // 超时计数器
+                    if (average > 0){
+                        smallbuff_state = true;//顺时针
+                        init_a_omega_level = false;
+                        init_stuck_frames = 0;
+                    }else if (average < 0){
+                        smallbuff_state = false;//逆时针
+                        init_a_omega_level = false;
+                        init_stuck_frames = 0;
+                    } else if (init_a_omega_level) {
+                        // 数据不足, 累计超时
+                        init_stuck_frames++;
+                        if (init_stuck_frames > 60 && delta_angle_data.size() >= 2) {
+                            double forced_avg = 0;
+                            for (size_t k = 0; k < delta_angle_data.size(); k++)
+                                forced_avg += delta_angle_data[k];
+                            forced_avg /= delta_angle_data.size();
+                            smallbuff_state = (forced_avg > 0);
+                            init_a_omega_level = false;
+                            init_stuck_frames = 0;
+                            cout << "小符超时强制初始化, 方向=" << (smallbuff_state?"顺时针":"逆时针") << endl;
+                        }
+                    }
+                }
+                // Initialize small buff speed from measured data instead of hardcoded 60°/s
+                if (std::abs(average) > 1e-9) {
+                    smallbuff_speed = std::abs(average);
+                } else {
+                    smallbuff_speed = PI/3 * delta_t; // 保底: 60°/s
+                }
+                smallbuff_count = 0;//初始化计数器
+            } else {
+                smallbuff_count++;
+
+                // 每30帧用最近数据EMA更新速度估计
+                if (smallbuff_count >= 30 && smallbuff_count % 30 == 0) {
+                    vector<double> delta_angle_filter_;
+                    int start_idx = max(0, (int)delta_angle_data.size() - 60);//取最近60帧
+                    for (int i = start_idx + 1; i < (int)delta_angle_data.size(); i++)
+                    {
+                        //除去突变差分角(角度相邻间隔不超过5度)
+                        if (abs(delta_angle_data[i] - delta_angle_data[i-1]) < PI*0.028){
+                            delta_angle_filter_.push_back(delta_angle_data[i]);
+                        }
+                    }
+                    if (!delta_angle_filter_.empty()) {
+                        double measured_speed = mean(delta_angle_filter_);
+                        double alpha = 0.3;//EMA系数
+                        smallbuff_speed = alpha * measured_speed + (1.0 - alpha) * smallbuff_speed;
+                        cout << "小符速度EMA更新: " << smallbuff_speed / delta_t * 180 / PI << " 度/秒" << endl;
+                    }
+                }
+
+                //EMA平滑预测输出，抑制逐帧抖动
+                if (smallbuff_smooth_pred == 0) smallbuff_smooth_pred = smallbuff_speed;
+                smallbuff_smooth_pred = 0.25 * smallbuff_speed + 0.75 * smallbuff_smooth_pred;
+
+                //根据旋转方向返回预测角度
+                if (smallbuff_state){
+                    return smallbuff_smooth_pred;//顺时针
+                }else{
+                    return (-1)*smallbuff_smooth_pred;//逆时针
+                }
+            }
+
+        }
+
+        cout << "预测未进入！" << endl;
+        return 0;//如果函数出现异常则返回零
+        
+    }
+
+private:
+    
+            bool seres_stop = false;//根据负反馈结果判断是否停止优化
+
+            int ceres_data_count = 0;//优化数据的数量
+
+            //定值函数的参数（函数取值范围的均值）
+            double const_level = 0;//平移
+            double const_omega = 0;//角速度
+            double const_a = 0;//振幅
+
+            //大符的顺逆
+            bool big_rotate_state = true;//true逆，反则反
+
+            //优化后函数的参数
+            double a = 0;
+            double a_temp = 0;
+            double omega = 0;
+            double level = 0;
+
+            //参数初始化
+            bool init_a_omega_level = true;//等于true即未初始化，反之为已初始化
+
+            //平滑数据储存器
+            vector<double> moving_average_angle_data;//平滑数据储存器
+            vector<double> filter_angle_data;
+
+            //优化结果的范围
+            double max_level = 0;//最大平移
+            double max_omega = 0;//最大角速度
+            double max_a = 0;//最大振幅
+            double min_level = 0;//最小平移
+            double min_omega = 0;//最小角速度
+            double min_a = 0;//最小振幅
+
+            //优化所用时间
+            double ceres_time_milliseconds = 0;
+
+            //大符此时处于函数中的状态（上升下降）
+            int count_ = 0;//经过极值过后不进行判断的次数
+            int lag_count = 0;//相邻重复符合极值条件的次数，经过一定次数才可算是经过极值
+            int over_a = 0;//超越振幅重复次数，经过一定次数才能扩大a
+            bool bigbuff_state = false;//上下标识符，上升为1，反之为零
+
+            //大符的相位
+            double phase = 0;
+
+            //大符预测的相位
+            double predicted_phase = 0;
+
+            //矫正预测判断（使用极值作为预测矫正）及其相位及其返回预测角时的下标
+            bool predicted_rectify = true;
+            double rectify_phase = 0;
+            double rectify_time_index = 0;
+
+            //大符预测的角度
+            double predicted_angle = 0;
+
+            //储存大符预测的角度和其现实的时间的容器
+            vector<double> predicted_angle_data;//角度
+
+            //小符此时的状态（顺时针还是逆时针）
+            bool smallbuff_state = false;//true顺false逆标识符
+            double smallbuff_speed = 0;//小符速度
+            int smallbuff_count = 0;//小符帧计数(用于定时EMA更新)
+            double smallbuff_smooth_pred = 0;//小符预测EMA平滑值
+
+};
+
+
+//整体逻辑：坐标转极角 → 采集样本判断旋转方向 → 角度连续化修正 + 圈数统计 → 数据缓存 / 差分计算 → 点位预测（预留）
+class Fu_angleprocess//角度处理器
+{
+public:	//注：角度是指极坐标系下当前射线与x轴正方向夹角，夹角是指当前射线与后一射线的角度差值
+    //参数
+    float angle_ = 0.f;
+	int loop_count = 0;//当前转动第几圈
+	float angle_back = 0;//前一角度
+	float angle_now = 0;//后一角度
+	float angle_include = 0;//夹角
+	float angle_polar_back = 0;//极坐标前一角度
+	float angle_polar_now = 0;//极坐标当前角度
+	float radius_buff = 0;//能量机关的半径
+	bool anticlockwise = true; //默认逆时针为正方向
+	bool anticlockwise_flag = false;//方向是否判断成功
+	bool loop_add_flag = false;//判断是否可以增加圈数
+	bool first_angle = true;//传入第一个角度
+	cv::Point2f point_pre;//预测出来的二维点
+	cv::Point2f point_center_back;//保留预测前的二维点
+	vector<float> trun_count;//角度数组(用于判断旋转方向)
+    vector<float> angle_date;//角度数组(储存迄今为止所有角度)
+    vector<double> angle_time;//角度数组(用于判断旋转方向)
+    double angle_diff = 0;//角度差分
+    vector<double> angle_diff_vec;//差分角度容器
+
+//polar_angle(circle_center, armor_center)
+//├─ 计算相对偏移 cartesian_x = 目标X - 圆心X
+//├─ 计算相对偏移 cartesian_y = 目标Y - 圆心Y
+//├─ 计算两点距离radius，存入全局radius_buff
+//├─ 判断x、y正负，标记x_flag、y_flag
+//├─ 用反余弦算出基础锐角angle
+//├─ 根据所在象限(x_flag,y_flag)换算完整极角theta
+//└─ 返回极角theta（弧度，X轴正方向逆时针）
+    float polar_angle(cv::Point2f circle_center, cv::Point2f armor_center)
+	//自定义函数 polar_angle，输入旋转圆盘中心和装甲板中心两个坐标，输出极坐标角度（射线与 X 轴正方向夹角），同时记录旋转半径。
+    {
+		bool x_flag = false, y_flag = false;
+		float angle = 0;
+		float theta = 0;
+        //cartesian_x = 目标装甲板中心点 X 方向相对偏移量
+		float cartesian_x = armor_center.x - circle_center.x;//笛卡尔坐标系
+		float cartesian_y = armor_center.y - circle_center.y;
+		float radius = sqrt(cartesian_x * cartesian_x + cartesian_y * cartesian_y);
+		this->radius_buff = radius;
+		//判断坐标在哪个象限，根据象限加角度
+		cartesian_x >= 0 ? (x_flag = true) : (x_flag = false);
+		cartesian_y >= 0 ? (y_flag = true) : (y_flag = false);
+		//计算出当前直线与x轴的夹角
+		angle = acos(abs(cartesian_x) / radius);
+		x_flag ? (y_flag ? (theta = angle + 0) : (theta = 1.5 * PI + (0.5 * PI - angle))) : (y_flag ? (theta = 0.5 * PI + (0.5 * PI - angle)) : (theta = angle + 1 * PI));
+		//cout << theta * (180 / PI) << endl;
+		return theta;
+	}
+
+	//用于自动识别能量机关圆盘整体旋转方向（顺时针 / 逆时针），只在角度缓存积累满 21 组数据时完成一次判断，判定后永久锁定方向不再重复计算。
+	//4_27角度判读正确
+	void turn(float angle)//放入角度
+	{
+		//cout << "-----------判断方向--------------" << endl;
+		if (this->trun_count.size() < 21) this->trun_count.push_back(angle);
+
+		if (this->trun_count.size() == 21 && this->anticlockwise_flag == false)
+		{
+            vector<double> angle_filter;//角度滤波函数
+            for (int i = 1; i < trun_count.size(); i++)
+            {
+                //除去突变差分角(角度相邻间隔不超过5度)
+                if (abs(trun_count[i] - trun_count[i-1]) < PI*0.028){
+                    angle_filter.push_back(trun_count[i]);
+                }
+            }
+            
+			int positive_count = 0;//正转次数
+			int negative_count = 0;//反转次数
+			for (int i = 0; i < angle_filter.size(); i++)
+			{
+				if (i != 0)
+				{
+					if (abs(angle_filter[i] - angle_filter[i - 1]) >= 300 || abs(angle_filter[i] - angle_filter[i - 1]) == 0) continue;
+					else if ((angle_filter[i] - angle_filter[i - 1]) > 0)  positive_count++;
+					else if ((angle_filter[i] - angle_filter[i - 1]) < 0)  negative_count++;
+				}
+			}
+			if (positive_count > negative_count)
+			{
+				//正转
+				this->anticlockwise = true;
+				this->anticlockwise_flag = true;
+				std::cout << "正转，buff顺时针转" << endl;
+			}
+			else if (negative_count > positive_count)
+			{
+				//反转
+				this->anticlockwise = false;
+				this->anticlockwise_flag = true;
+				std::cout << "反转，buff逆时针转" << endl;
+			}
+			else
+			{
+				std::cout << "Not enough data to judge anticlockwise (555row)" << endl;
+				this->trun_count.clear();
+				return;
+			}
+		}
+		return;
+	}
+
+	//根据正反转以及圈数完成累加
+	//角度统一修正函数
+    //先判断转向：顺时针 → 角度减整圈，转为负区间保证连续；
+    //非首帧，计算前后帧角度差；
+    //若是逆时针，按角度所在区间分三段处理：
+    //0°~30°：修正角度、打开加圈标记；
+    //355°~360°：修正角度、关闭加圈标记；
+    //中间区间：正常加圈、角度修正 + 检测 360° 跳变并补计圈数；
+    //最终输出连续无跳变的累计角度，用于后续滤波、测速、瞄准计算
+	float angle2kf(float angle)
+	{
+		
+		if (this->angle_now == 0 && !this->anticlockwise && this->anticlockwise_flag)//反转
+		{
+			angle_ = angle_ - 6.283185;//顺时针旋转时做角度值域修正
+		}
+		else if (!this->anticlockwise && this->anticlockwise_flag) angle_ = angle_ - 6.283185;
+		// cout << "angle " << angle_ << endl;
+		if (!this->first_angle)
+		{
+			this->angle_include = abs(this->angle_polar_now - this->angle_polar_back);//极坐标下的角度差值
+		}
+		if (this->anticlockwise && this->anticlockwise_flag)//正转
+		{
+			if (angle_ >= 0 && angle_ <= 0.5235986)//0 <= x <= 30 loop_count
+			{
+				if (this->first_angle)//是第一个角度，且进入加圈状态
+				{
+					loop_count--;//配合逆时针旋转的角度跳变规则，修正累计圈数。
+					angle_ = angle_ + 6.283185 * (loop_count + 1);//6.283185（一整圈 360°）
+					loop_add_flag = true;
+				}
+				else
+				{
+					angle_ = angle_ + 6.283185 * (loop_count + 1);
+					loop_add_flag = true;
+				}
+				// cout << "1" << endl;
+			}
+			else if (angle_ >= 6.195918 && angle_ <= 6.283185)//355 <= x <= 360
+			{
+				angle_ = angle_ + 6.283185 * loop_count;
+				loop_add_flag = false;
+				// cout << "2" << endl;
+			}
+			else if (angle_ > 0.5235986 && angle_ < 6.195918)//30 < x < 355
+			{
+				if (loop_add_flag)
+				{
+					loop_count++;
+					loop_add_flag = false;
+					// cout << "true3" << endl;
+				}
+				angle_ = angle_ + 6.283185 * loop_count;
+				if (this->angle_include >= 1.047197 && this->angle_include <= 5.232986 && this->angle_polar_back > this->angle_polar_now)//若跳到之前的角后，则相当于再转了一圈
+				{
+					loop_count++;
+					angle_ = angle_ + 6.283185 * loop_count;
+				}
+				// cout << "3" << endl;
+			}
+		}
+		// cout << angle_<< endl;
+		//  cout << "loop_count" << loop_count << endl;
+		if (!this->anticlockwise && this->anticlockwise_flag)//反转
+		{
+			if (angle_ <= 0 && angle_ >= -0.5235986)//-30 <= x <=0
+			{
+				if (this->first_angle)
+				{
+					loop_count--;
+					angle_ = angle_ - 6.283185 * (loop_count + 1);
+					loop_add_flag = true;
+				}
+				else
+				{
+					angle_ = angle_ - 6.283185 * (loop_count + 1);
+					loop_add_flag = true;
+				}
+			}
+			else if (angle_ <= -6.195918 && angle_ >= -6.283185)//-360 <= x <=-355
+			{
+				angle_ = angle_ - 6.283185 * loop_count;
+				loop_add_flag = false;
+			}
+			else if (angle_ < -0.5235986 && angle_ > -6.195918)//-355 < x < -30
+			{
+				if (loop_add_flag == true)
+				{
+					loop_count++;
+					loop_add_flag = false;
+				}
+				angle_ = angle_ - 6.283185 * loop_count;
+				if (this->angle_include >= 1.047197 && this->angle_include <= 5.232986 && angle_polar_back < this->angle_polar_now)//若跳到之前的角后，则相当于再转了一圈
+				{
+					loop_count++;
+					angle_ = angle_ - 6.283185 * loop_count;
+				}
+			}
+		}
+		this->angle_polar_back = angle;
+		this->first_angle = false;//运行过一次之后，证明不再第一个进去的角度
+		//cout << "angle " << angle_ << endl;
+		// cout << angle_ * 180 / PI << endl;
+		// cout << "---------------" << endl;
+		return angle_;
+	}
+
+
+    //角度差分函数
+    //给定一段预测时长 delta_t，从历史多帧角度时序缓存里，取出距离当前刚好 delta_t 秒前的风车角度，计算角度差；
+    //同时做三层校验：数据量校验、时间间隔超时校验、360° 跨圈角度跳变矫正；
+    //最终输出「过去 delta_t 时间内风车转过的角度差」，用来计算平均角速度 ω = angle_diff /delta_t，是能量机关旋转预测的核心输入。
+    double angle_diff_fun(const double delta_t, const double fps) {
+        if (this->angle_time.size() < fps * delta_t) {//fps * delta_t这段时长内对应的总帧数
+            // cout << "数据不足" << endl;
+            return -50; // 数据不够
+        }
+    //angle_time[size-i]：i 帧之前的时间戳
+        for (int i = static_cast<int>(fps*delta_t*0.5); i<=this->angle_time.size(); i++) {
+            if (this->angle_time.back()-this->angle_time[this->angle_time.size()-i] > delta_t*1000+80) { // 上限为德尔塔T+0.5秒
+                // std::cout << "差分时间超时！可能目标丢失" << std::endl;
+                return -50;
+            }
+            //单纯用帧数算时间会出错（丢帧、卡顿、帧率不稳），所以循环不断增加 i，往更早的历史里找
+            if (this->angle_time.back()-this->angle_time[this->angle_time.size()-i] >= delta_t*1000) {
+                //cout << "差分数据下标：" << this->angle_time.size() << "  " << this->angle_time.size()-i+1 << endl;
+                //this->angle_diff = this->angle_date.back()-this->angle_date[this->angle_date.size()-i];//数据不局部平滑
+                // 5点均值平滑代替单帧角度，降噪
+                this->angle_diff = this->angle_date.back()-(this->angle_date[this->angle_date.size()-i]+this->angle_date[this->angle_date.size()-i-1]+this->angle_date[this->angle_date.size()-i+1]+this->angle_date[this->angle_date.size()-i-2]+this->angle_date[this->angle_date.size()-i+2])/5;
+                // cout << "差分时间：" << this->angle_time.back()-this->angle_time[this->angle_time.size()-i+1] << endl;
+                // cout << "差分角：" << this->angle_diff << endl;
+                if ((std::abs(this->angle_diff)>1.169 || (anticlockwise && this->angle_diff<0) || (!anticlockwise && this->angle_diff>0)) && this->anticlockwise_flag) { // 差分角大于67度则判断是否异常和判断正逆时针的差分角大于小于零,可能为扇页跳变
+                    for (int j = -5; j <= 5; j++) { // 使用不同的索引以避免与外部循环冲突
+                        if (this->anticlockwise && (angle_diff-(2*j*PI/5))<(2*PI/6.55) && (angle_diff-(2*j*PI/5))>0) { // 补角误差达到58度以下则返回补角(顺时针)
+                            cout << "矫正后差分的角度:" << ((angle_diff)-(2*j*PI/5)) << endl;
+                            return angle_diff-(2*j*PI/5);
+                        }else if (!this->anticlockwise && (angle_diff-(2*j*PI/5))>(-2*PI/6.55) && (angle_diff-(2*j*PI/5))<0){// 补角误差达到58度以下则返回补角(逆时针)
+                            cout << "矫正后差分的角度:" << ((angle_diff)-(2*j*PI/5)) << endl;
+                            return angle_diff-(2*j*PI/5);
+                        }
+                    }
+                    // cout << "差分异常" << endl;
+                    // return -50; // 异常
+                } else {
+                    // cout << "差分的角度：" << this->angle_diff << endl;
+                    return this->angle_diff;
+
+                }
+            }
+        }
+        cout << "差分异常" << endl;
+        return -50; // 异常
+    }
+
+    //传入角度和半径，得到x,y坐标
+	cv::Point2f x_y_cal(const double &angle, const double &radius)
+	{
+		Eigen::MatrixXf point2d_(2, 1);//二维像素坐标向量
+		Eigen::MatrixXf radius_matrix(2, 2);
+		Eigen::MatrixXf angel_matrix(2, 1);//角度+角速度状态向量
+		radius_matrix <<
+			radius, 0,
+			0, radius;
+		angel_matrix <<
+			cos(angle),
+			sin(angle);
+		point2d_ = radius_matrix * angel_matrix;
+		point_pre = cv::Point2f(point2d_(0, 0) + point_center_back.x, point2d_(1, 0) + point_center_back.y);
+		// cout << "calc" << point2d_ << endl;
+		// cout << "point:" << point_pre.x << " " << point_pre.y << endl;
+		// cout << "pre_angle "  << angle << endl;
+		return point_pre;
+	}
+
+    //预测前角度处理(circle_center为中心R中心，armor_center为装甲板中心，time为与该角度相对应的时间单位为毫秒,delta_t为德尔塔T，fps为帧率。)
+	double pre_predict_angle_process(const cv::Point2f &circle_center, const cv::Point2f &armor_center,const double &time, const double &delta_t, const double &fps)
+	{
+		float angle = 0;
+		//判断数据是否丢帧,点的值是否都是在图幅内
+		if (
+			(circle_center.x > 0 && circle_center.x <= 1280) &&
+			(circle_center.y > 0 && circle_center.y <= 1024) &&
+			(armor_center.x > 0 && armor_center.x <= 1280) &&
+			(armor_center.y > 0 && armor_center.y <= 1024)
+			)
+		{
+			//保留了圆心点
+			//cout << "-----------------" << endl;
+			this->point_center_back.x = circle_center.x;
+			this->point_center_back.y = circle_center.y;
+			angle = this->polar_angle(circle_center, armor_center);//极坐标系下角度
+			this->turn(angle);//判断正反转
+			angle = this->angle2kf(angle);//得到可以累加的角度
+			//cout << "累加的角度：" << angle/PI << "PI" << endl;;
+            this->angle_date.push_back(angle);//储存角度
+            this->angle_time.push_back(time);//储存对应时间
+            this->angle_diff = angle_diff_fun(delta_t, fps);//获得差分角
+			//cout << "差分的角度：" << this->angle_diff << endl;;
+            if (this->angle_diff != -50){//判断差分角是否正确
+                return this->angle_diff;
+            }else{
+                // cout << "角度差分错误！" << endl;
+		        return -1;
+            }
+		}else{
+            // cout << "角度差分错误！" << endl;
+		    return -1;
+        }
+
+	}
+
+    //预测后角度处理
+    cv::Point2f post_predict_angle_process(const double &angle, const double &radius)
+	{
+        //传入完整的预测角度和半径，得到x,y坐标
+        return x_y_cal(angle, radius);;
+	}
+
+private:
+
+};
+
+//重力补偿器
+class PnPSolver_gravity
+{
+public:
+
+//构造函数用于初始化相机内参和畸变系数和目标三维坐标(以目标中心建系)
+PnPSolver_gravity()
+{
+  // Unit: mm
+  //上y左z向前x
+  constexpr float half_top_x = BLADE_TOP_WIDTH/2;//0.15米
+  constexpr float half_bottom_x = BLADE_BOTTOM_WIDTH/2;//0.15米
+  constexpr float half_top_y = BLADE_TOP_HEIGHT/2;//0.15米
+  constexpr float half_bottom_y = BLADE_BOTTOM_HEIGHT/2;//0.15米
+  // constexpr float radius = BLADE_RADIUS;
+
+  /*
+  Start from bottom left in clockwise order
+  Model coordinate: z forward, x left, y up
+  12
+  03
+  */
+  blade_points_.emplace_back(cv::Point3f(-half_bottom_x, -half_bottom_y, 0));
+  blade_points_.emplace_back(cv::Point3f(-half_top_x, half_top_y, 0));
+  blade_points_.emplace_back(cv::Point3f(half_top_x, half_top_y, 0));
+  blade_points_.emplace_back(cv::Point3f(half_bottom_x, -half_bottom_y, 0));
+
+//转置相机内参
+// transpose(camera_matrix_, camera_matrix_);
+}
+
+// Get 3d position
+  //传入二维点进行解算
+bool solvePnP(const cv::Point2f & left_bottom, const cv::Point2f & left_top, const cv::Point2f & right_top, const cv::Point2f & right_bottom, cv::Mat & rvec, cv::Mat & tvec)
+{
+  std::vector<cv::Point2f> image_blade_points;
+
+  // Fill in image points
+  image_blade_points.emplace_back(left_bottom);
+  image_blade_points.emplace_back(left_top);
+  image_blade_points.emplace_back(right_top);
+  image_blade_points.emplace_back(right_bottom);
+
+  // Solve pnp
+  return cv::solvePnP(
+    blade_points_, image_blade_points, camera_matrix_, dist_coeffs_, rvec, tvec, false,
+    cv::SOLVEPNP_IPPE);//SOLVEPNP_IPPE更精确，SOLVEPNP_P3P更快速。
+}
+
+// Calculate the distance between blade center and image center
+  //用于计算图像中某一点到图像中心的距离
+float calculateDistanceToCenter(const cv::Point2f & image_point)
+{
+  float cx = camera_matrix_.at<double>(0, 2);
+  float cy = camera_matrix_.at<double>(1, 2);
+  return cv::norm(image_point - cv::Point2f(cx, cy));
+}
+
+//计算空间角
+cv::Point2f calculate_space_angle(const cv::Point2f & center)
+{
+    static cv::Point2f cameraCenter = cv::Point2f(camera_matrix_.at<double>(0, 2)-23,camera_matrix_.at<double>(1, 2)+24); 
+    //static cv::Point2f cameraCenter = cv::Point2f(camera_matrix_.at<double>(0, 2),camera_matrix_.at<double>(1, 2)); 
+    // return cv::Point2f(center.y, center.x);
+	double pitch, yaw;
+	double fx, fy;
+	fx = camera_matrix_.at<double>(0, 0);
+	fy = camera_matrix_.at<double>(1, 1);
+	//     
+	yaw = atan((cameraCenter.x - center.x) / fx);
+	pitch = -atan((cameraCenter.y - center.y) / fy);
+    return cv::Point2f(pitch, yaw);
+
+//     double pitch, yaw;
+//     // 检查分母是否为零
+//     if (tvec.at < double >(2, 0) == 0) {
+//         std::cerr << "Error: z component is zero, cannot calculate yaw." << std::endl;
+//         return cv::Point2f(0, 0);
+//     }
+//     if (sqrt(tvec.at < double >(2, 0)* tvec.at < double >(2, 0) + tvec.at < double >(0, 0) * tvec.at < double >(0, 0)) == 0) {
+//         std::cerr << "Error: x and z components are both zero, cannot calculate pitch." << std::endl;
+//         return cv::Point2f(0, 0);
+//     }
+//     //计算空间角(相机坐标系是右手系)
+//     //角度
+//     pitch = -atan2(tvec.at < double >(1, 0),  sqrt(tvec.at < double >(2, 0)* tvec.at < double >(2, 0) + tvec.at < double >(0, 0) * tvec.at < double >(0, 0)));
+//     yaw = atan2(tvec.at < double >(0, 0), tvec.at < double >(2, 0));
+//     //cout << "pitch" << pitch*180/PI << "度  " << "yaw" << yaw*180/PI << "度  " << endl;
+//     cout << "pitch" << pitch << "弧度  " << "yaw" << yaw << "弧度  " << endl;
+//     cv::Point2f space_angle = cv::Point2f(pitch, yaw);
+//   return space_angle;
+}
+
+//重力补偿
+double time_parameter = 0;//将时间定义在类内函数外用于类外提取飞行时间
+double calculateTrajectory(const cv::Mat& tvec, const double &car_pitch) {
+    const int iteration_times = 30; // 迭代上限次数
+    //const float resistance = 0.092f; // 空气阻力系数
+    float velocity = 24; // 打弹速度
+    if(RmSerialData.BulletVec > 10){
+        velocity = RmSerialData.BulletVec;
+    }
+    const float gravity = 9.8f; // 重力加速度
+
+    //距离
+    double modl_length = norm(tvec) * 0.001;//模长(单位米)
+    // cout <<"距离:"<< modl_length << "米" << endl;//输出距离
+    //相机坐标系下的pitch
+    double camere_pitch = -atan2(tvec.at < double >(1, 0),  sqrt(tvec.at < double >(2, 0)* tvec.at < double >(2, 0) + tvec.at < double >(0, 0) * tvec.at < double >(0, 0)));
+
+    // 计算初始角度
+    double pitch_angle = camere_pitch - car_pitch;
+
+    // 提取平移向量的分量作为目标位置（单位米）
+    float target_z = modl_length * std::sin(pitch_angle); // 高度
+    // cout << "高度:" << target_z << "米" << endl;
+
+    // 计算到目标位置的总距离（模）
+    double distance = modl_length * std::cos(pitch_angle);// 距离
+    // cout << "距离:" << distance << "米" << endl;
+
+    double height_difference = 0;
+    double impact_point_height = 0;
+           time_parameter = 0;//将时间定义在类内函数外用于类外提取飞行时间
+    //double r = std::max(resistance, 1e-4f); // 确保阻力值不为零
+
+    double iterative_height = target_z; // 迭代高度用于在每次迭代中计算角度
+
+    for (int i = 0; i < iteration_times; ++i) {
+        pitch_angle = std::atan2(iterative_height, distance);
+
+        // 检查角度是否超过限制
+        if (std::abs(pitch_angle) > M_PI*0.165) { // 角度不超过72度
+            std::cerr << "异常:补偿角度超过30度!" << std::endl;
+            return -50; // 超过角度限制，返回-50
+        }
+
+        // 计算时间参数，基于水平位置、阻力、速度和角度计算物体飞行时间,t = (float)((exp(k* s) - 1) / (k * v * cos(angle)));
+        //time_parameter = (float)((std::exp(r*distance)-1)/(r*velocity*std::cos(pitch_angle)));
+        time_parameter = distance/(velocity*std::cos(pitch_angle));
+        if (time_parameter < 0) {
+            // 由于严重超出最大射程，计算过程中浮点数溢出，导致time_parameter变成负数
+            std::cerr << "异常:由于严重超出最大射程,计算过程中浮点数溢出,导致time_parameter变成负数!" << std::endl;
+            time_parameter = 0;
+            return -50; // 返回-50，表示计算失败
+        }
+
+        // 计算当前角度下的弹道落点高度,z = (float)(v * sin(angle) * t - GRAVITY * t * t / 2);
+        impact_point_height = (velocity*std::sin(pitch_angle)*time_parameter-0.5*gravity*time_parameter*time_parameter);
+
+        // 计算高度差
+        height_difference = target_z - impact_point_height;
+
+        // 如果高度差在容差范围内，停止迭代
+        if (std::abs(height_difference) < 0.0001) {
+            // cout << "重力补偿成功！" << endl;
+            // cout << "最终计算的重力补偿角：" << pitch_angle << endl;
+            // cout << "计算的飞行时间：" << time_parameter << endl;
+            break;
+        }
+        // 调整高度以进行下一次迭代
+        iterative_height += height_difference;
+    }
+
+    if (std::abs(height_difference) > 0.01 || std::abs(pitch_angle) > M_PI*0.165) {
+        std::cerr << "异常:高度差过大或角度超出限制!" << std::endl;
+        return -50; // 高度差过大或角度超出限制，返回-50
+    }
+
+    // 返回计算出的角度
+    return (pitch_angle+car_pitch); // 直接返回计算出的角度
+}
+
+
+
+//总处理函数
+cv::Point2f PnPSolver_and_gravity(const cv::Point2f & left_bottom, const cv::Point2f & left_top, const cv::Point2f & right_top, const cv::Point2f & right_bottom, const double &car_pitch)
+{
+  cv::Mat rvec;
+  cv::Mat tvec;
+  cv::Point2f space_angle = {0, 0};    //储存空间角
+  cv::Point2f center = (left_top + right_bottom) / 2;
+  cout << "PXCenter:" << center << endl;
+  if (solvePnP(left_bottom, left_top, right_top, right_bottom, rvec, tvec))//解算位姿态
+  {
+    space_angle = calculate_space_angle(center);//获取空间角
+    if (abs(space_angle.x) > PI*0.165){//异常检测
+        cout << "异常:PnP角度超过30以上!" << endl;
+        cout << "pitch:" << space_angle.x*180/PI << endl;
+        cout << "yaw: " << space_angle.y*180/PI << endl;
+        cout << "tvec.x:" << tvec.at<double>(0, 0) << "毫米" << endl;
+        cout << "tvec.y:" << tvec.at<double>(1, 0) << "毫米" << endl;
+        cout << "tvec.z:" << tvec.at<double>(2, 0) << "毫米" << endl;
+        space_angle.x = 0;
+        space_angle.y = 0;
+    }
+    space_angle.x = calculateTrajectory(tvec, car_pitch);//获得pitch重力补偿
+    if (space_angle.x == -50){//异常检测
+        cout << "补偿异常！" << endl;
+        space_angle.x = 0;
+        space_angle.y = 0;
+    }
+
+        ////////////
+    // cout << "光心1：" << camera_matrix_.at<double>(0, 2) << endl;
+    // cout << "光心1：" << camera_matrix_.at<double>(1, 2) << endl;
+    ///////////
+
+    return space_angle;
+  }else{
+    cout << "PnP位姿解算失败!" << endl;
+    return space_angle;
+  }
+
+}
+
+
+private:
+    cv::Mat camera_matrix_ = (Mat_<double>(3, 3) << 1692.72620365811, 0.363957161762693, 643.964129877484, 0, 1692.43288845269, 502.492890249832, 0, 0, 1);
+    cv::Mat dist_coeffs_ = (Mat_<double>(1, 5) << -0.111874561711212, -0.000296513404483851, 0.884391394501360, -0.00202166770416446, -1.84111324474713);
+
+  /*1704.45313471055	0.460601854648428	665.913826347723
+    0	1704.60254015387	487.291315275975
+    0	0	1
+
+
+
+    -0.0817259940211909	0.392083347020012	-0.140959043006811
+
+
+
+-0.000578920794543104	0.00187156396493549*/
+
+  // Unit: mm
+  static constexpr float BLADE_TOP_WIDTH = 300.0;
+  static constexpr float BLADE_BOTTOM_WIDTH = 300.0;
+  static constexpr float BLADE_TOP_HEIGHT = 300.0;
+  static constexpr float BLADE_BOTTOM_HEIGHT = 300.0;
+  static constexpr float BLADE_RADIUS = 700.0;
+
+  // Four vertices of blade in 3d
+  std::vector<cv::Point3f> blade_points_;
+};
+
+
+//前处理
+class pretreatment
+{
+//
+//first_frame_yolo(frame)
+//├─ 复制图像+定义临时变量
+//├─ YOLO检测中心R
+//│  ├─ 无R → 初始化失败，返回空
+//│  └─ 收集置信度、过滤越界框→排序选最优R框
+//├─ YOLO检测扇叶
+//│  ├─ 无扇叶 → 初始化失败，返回空
+//│  └─ 收集置信度、过滤越界框→排序选最优扇叶框
+//├─ 计算扇叶边长、R与扇叶中心点
+//├─ 存入两点坐标容器
+//├─ 标记初始化成功
+//└─ 返回中心点容器
+public:
+//参数
+bool first_frame_yolo_success = false;//第一帧是否识别成功
+
+double side =  0;
+
+//识别第一帧目标
+vector<cv::Point2f> first_frame_yolo(cv::Mat frame)
+{
+    // cout << "未识别第一帧R" << endl;
+    cv::Mat frame_detect = frame.clone();
+
+    //参数
+    vector<float> fan_score_container;//扇页置信度容器
+    vector<float> R_score_container;////中心R置信度容器
+    cv::Rect Fan_box;//检测扇页识别结果是否合理
+    cv::Rect R_box;//检测中心R识别结果是否合理
+    cv::Rect Yolov8_Fan_Box;//储存最终扇页识别结果
+    cv::Rect Yolov8_R_Box;//储存最终中心R识别结果
+    cv::Point2f center_R_Box;//中心R中心
+    cv::Point2f center_Fan_Box;//扇页中心
+    vector<cv::Point2f> center;//用于返回center_R_Box和center_Fan_Box；
+
+    // 第一帧R
+    // cout << "未识别第一帧R" << endl;
+    result_R = yolofumodel->detect(frame_detect);
+    if (result_R.empty()) {
+        // cout << "未识别R" << endl;
+        first_frame_yolo_success = false;
+        return center;
+    } else {
+        for (int i = 0; i < result_R.size(); i++) {
+            int class_id = result_R[i].class_id; // 设置文本的内容
+            // 识别R的部分
+            if (class_id == 0) { 
+                R_box = result_R[i].box;
+                float R_score = result_R[i].confidence; // 获得可信度
+                R_score_container.push_back(R_score);
+                if (R_box.x < 0 || R_box.y < 0 || R_box.x > frame_detect.cols || R_box.y > frame_detect.rows) {
+                    continue;
+                }
+            }
+        }
+        if (R_score_container.empty()) { first_frame_yolo_success = false; return center; }
+    }
+    sort(R_score_container.begin(), R_score_container.end(), cmp);//排序置信度，找出最好的结果
+    for (int i = 0; i < result_R.size(); i++) {
+        if (R_score_container[0] == result_R[i].confidence) {
+            Yolov8_R_Box = cv::Rect(result_R[i].box.x, result_R[i].box.y, result_R[i].box.width, result_R[i].box.height); // yolov8
+            R_score_container.clear();
+            break;
+        }
+    }
+
+    //第一帧Fan
+    result_Fan = yoloFanmodel->detect(frame_detect);
+    if (result_Fan.empty()) { 
+        // // cout << "未识别Fan" << endl;
+        first_frame_yolo_success = false;
+        return center;
+    } else {
+        for (int i = 0; i < result_Fan.size(); i++) {
+            int class_id = result_Fan[i].class_id;      // 设置文本的内容
+            float fan_score = result_Fan[i].confidence; // 获得可信度
+            fan_score_container.push_back(fan_score);
+            // 判断Fan的部分
+            if (class_id == 0) {
+                Fan_box = result_Fan[i].box;
+                if (Fan_box.x < 0 || Fan_box.y < 0 || Fan_box.x > frame_detect.cols || Fan_box.y > frame_detect.rows) {
+                    continue;
+                }
+            }
+        }
+        sort(fan_score_container.begin(), fan_score_container.end(), cmp);//排序置信度，找出最好的结果
+        if (fan_score_container.empty()) { first_frame_yolo_success = false; return center; }
+        for (int i = 0; i < result_Fan.size(); i++) {
+            if (fan_score_container[0] == result_Fan[i].confidence) {
+                Yolov8_Fan_Box = cv::Rect(result_Fan[i].box.x, result_Fan[i].box.y, result_Fan[i].box.width, result_Fan[i].box.height); // yolov8
+                fan_score_container.clear();
+                break;
+            }
+        }
+    }
+
+    //获得扇页框边长
+    side = min(Yolov8_Fan_Box.width, Yolov8_Fan_Box.height);
+
+    // 计算中心点坐标
+    center_R_Box = {Yolov8_R_Box.x + Yolov8_R_Box.width / 2.0f, Yolov8_R_Box.y + Yolov8_R_Box.height / 2.0f};
+    center_Fan_Box = {Yolov8_Fan_Box.x + Yolov8_Fan_Box.width / 2.0f, Yolov8_Fan_Box.y + Yolov8_Fan_Box.height / 2.0f};
+    center.push_back(center_R_Box);
+    center.push_back(center_Fan_Box);
+
+    first_frame_yolo_success = true;//初始化成功
+    return center;
+}
+
+private:
+};
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+geometry_msgs::Vector3 Angle;
+// rm_msgs::RmSerial RmSerialData;
+double Qtn[4];
+ros::Publisher PubAngle;
+ros::Publisher debugpub;            //debug发布者  
+ros::Publisher debugpub1;           //debug1发布者
+/*主程序*/
+
+bool init = false;//初始化标识符
+cv::Mat frame;//处理帧
+cv::Mat frame_;//接收帧
+bool functional = true;//打符模式标识符
+double delta_t_ = 0.3;//差分时间
+double delta_t_compensation = 0.15;//程序运行时间+发弹时间(时间补偿)
+// double delta_t_compensation = 0.17;//程序运行时间+发弹时间(时间补偿)
+double pitch_compensation = 0.0;//pitch补偿
+double yaw_compensation = 0.0;//yaw补偿
+// double pitch_compensation = 0.0;//pitch补偿
+// double yaw_compensation = 0.0;//yaw补偿
+pretreatment* Pretreatment = nullptr;//初始化器
+identifies* Identifies = nullptr;//创建识别器
+Fu_angleprocess* Angleprocess = nullptr;;//创建角度处理器
+buff_predicted* Predicted = nullptr;;//创建预测器
+PnPSolver_gravity* pnpSolver_gravity = nullptr;;//创建重力补偿器
+
+//创建中间变量
+vector<cv::Point2f> Identifies_center;//识别结果中心容器
+double time_milliseconds = 0;//计时(单位毫秒)
+double angle_diff_temp = 0;//差分角度
+vector<double> angle_diff;//差分角度容器
+vector<double> angle_diff_time;//时间容器
+double predicted_diff_angle = 0;//预测差分角
+double final_angle = 0;//最终角度(原角度加上预测角)
+cv::Point2f final_angle_2D = {0, 0};//最终角度对应的图像点
+cv::Point2f euler_angles = {0, 0};//储存发送的空间角
+
+//时间参数w
+std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+
+//串口订阅回调函数
+//作用：doserial是串口回调函数，拷贝电控云台、四元数姿态数据，接收指令切换视觉开关与红蓝阵营标识，控制能量机关视觉程序运行状态。
+//rm_msgs::RmSerial：自定义 ROS 串口消息包，存储云台编码器、电控下发的各类数据；
+//ConstPtr：只读智能指针，回调接收串口话题传来的数据；
+//serail：消息变量，存放云台 Pitch、Yaw 角度等电控回传信息；
+void doserial(const rm_msgs::RmSerialConstPtr serail)
+{
+    //serail->Qw/Qx/Qy/Qz：下位机上传的姿态四元数四个分量。
+//作用：用来完整记录战车 IMU 采集的车身三维姿态（横滚、俯仰、偏航），相比欧拉角不会出现万向锁，稳定描述车体倾斜状态。
+    RmSerialData = *serail;
+    Qtn[0] = serail->Qw;
+    Qtn[1] = serail->Qx;
+    Qtn[2] = serail->Qy;
+    Qtn[3] = serail->Qz;
+    if(serail->ShootFlag == 'f'){
+        ROS_INFO_THROTTLE(2.0, "[Fu] 串口指令: 大符模式, Fu节点激活");
+        functional = true;
+    }
+    else if(serail->ShootFlag == 'a'){
+        ROS_INFO_THROTTLE(2.0, "[Fu] 串口指令: 装甲板模式, Fu节点休眠");
+        functional = false;
+    }else{
+        ROS_WARN_THROTTLE(2.0, "[Fu] 未知 ShootFlag='%c', 默认休眠", serail->ShootFlag);
+        functional = false;
+    }
+    if(serail->Camp=='b')
+    {
+        camp = 'r';
+    }
+    else if(serail->Camp=='r')
+    {
+        camp = 'b';
+    }
+    else{
+        camp = 'b';
+    }
+
+    // // cout << "7777777777777777777777777777777777777" << endl;
+    // camp = 'b';
+    // cout<<"----------"<<camp<<"------------"<<endl;
+    }
+
+    //图像订阅回调函数
+    //doimage是ROS图像回调，接收相机图像转OpenCV格式，更新相机状态，调用能量机关主处理函数Fu_Task完成全套视觉运算。
+    void doimage(const sensor_msgs::ImageConstPtr img)
+    {
+        cv_bridge::CvImagePtr cv_ptr; // 声明一个CvImage指针的实例
+        try
+        //try{}：异常监测代码块，包裹图像转换逻辑，捕捉转换时出现的错误。
+        {
+        //拷贝转换函数，把 ROS 图像转为 OpenCV 通用 BGR 三通道 8 位 Mat，生成独立图像内存。
+            cv_ptr =  cv_bridge::toCvCopy(img, sensor_msgs::image_encodings::BGR8); //将ROS消息中的图象信息提取，生成新cv类型的图象，复制给CvImage指针
+        }
+        catch(cv_bridge::Exception& e)  //异常处理
+        {
+            ROS_ERROR("cv_bridge exception: %s", e.what());
+            return;
+        }
+        frame_ = cv_ptr->image.clone();
+        // cout << "111111111111111111111111111111111111111111111" << endl;
+        // cout << "66666666666666666666666666666666666666666666" << endl;
+        //cout<<"2"<<endl;
+        // imshow("1",frame);
+        // waitKey(1);
+    }
+    // 相机正常：首帧初始化识别、预测、PnP 等算法模块，计算弹丸飞行时间；
+    //逐帧识别装甲，解扇叶旋转角并时序缓存，拟合角速度算出击打提前量；
+    //预测点经重力补偿 PnP 解算角度，叠加补偿后通过 ROS 下发云台；
+    //分段计时查耗时，画面绘制瞄准点与帧率用于调试；
+    //相机异常时释放内存、重置全局参数，避免程序崩溃。
+    bool Fu_Task()
+    {
+    frame = frame_.clone();
+    // cout<<"testtest"<<endl;
+    //functional 全局标记：true = 相机正常输出图像；false = 断流 / 打不开摄像头；
+    if(functional)
+    {
+        if(frame.empty()){
+            return false;
+        }
+    //帧率计算
+
+    std::chrono::steady_clock::time_point fps_start = std::chrono::steady_clock::now();
+
+    if (!init)
+    {
+        //初始化
+        //识别初始化(获得目标中心点)
+        //在堆内存创建 pretreatment 类的对象实例，完成类的初始化。
+        Pretreatment = new pretreatment();//初始化器
+
+        vector<cv::Point2f> first_center;//第一帧中心容器
+        //pretreatment 是自定义功能类，里面封装了 YOLO 检测、图像预处理等代码。
+        first_center = Pretreatment->first_frame_yolo(frame);
+        if (!Pretreatment->first_frame_yolo_success)
+        {
+            //cout << "第一帧识别失败！" << endl;
+            delete Pretreatment; // 删除对象
+            Pretreatment = nullptr;//初始化器
+            return false;
+        }
+        //cout << "第一帧识别成功！" << endl;
+        
+        //创建各部分(创建识别各个部分)
+        //
+        Identifies = new identifies(first_center[0],first_center[1],Pretreatment->side);//创建识别器
+        Angleprocess = new Fu_angleprocess();//创建角度处理器
+        Predicted = new buff_predicted();//创建预测器
+        pnpSolver_gravity = new PnPSolver_gravity();//创建重力补偿器
+
+        //飞行时间初始化(获得差分时间)
+        //输入装甲板四个图像角点 + 车辆俯仰角 Pitch，解算相机到装甲板的位姿（旋转、平移），引入车身俯仰角做重力修正，消除车身倾斜带来的 PnP 解算偏差。
+        pnpSolver_gravity->PnPSolver_and_gravity(cv::Point2f(first_center[1].x-Pretreatment->side*0.5,first_center[1].y+Pretreatment->side*0.5),
+                                                 cv::Point2f(first_center[1].x-Pretreatment->side*0.5,first_center[1].y-Pretreatment->side*0.5),
+                                                 cv::Point2f(first_center[1].x+Pretreatment->side*0.5,first_center[1].y-Pretreatment->side*0.5),
+                                                 cv::Point2f(first_center[1].x+Pretreatment->side*0.5,first_center[1].y+Pretreatment->side*0.5),
+                                                 RmSerialData.Pitch); //车坐标系pitch
+        //time_parameter：求解器内部浮点成员变量，时间相关阈值参数
+            if (pnpSolver_gravity->time_parameter < 0.5){
+            //compensation：补偿、修正
+            delta_t_ = pnpSolver_gravity->time_parameter + delta_t_compensation;
+            //cout << "时间初始化成功! delta_t_ = " << delta_t_ << endl;
+        }else{//超过 0.5 秒无有效 PnP（目标长时间丢失、叶片持续遮挡、PnP 解算持续失败）
+            //cout << "时间初始化失败! delta_t_ = " << delta_t_ << endl;
+            delete Pretreatment; // 删除对象
+            //指针 = nullptr：清空指针，防止后续代码误调用野指针导致段错误；
+            Pretreatment = nullptr;//初始化器
+            delete Identifies; // 删除对象
+            Identifies = nullptr;//识别器
+            delete Angleprocess; // 删除对象
+            Angleprocess = nullptr;;//角度处理器
+            delete Predicted; // 删除对象
+            Predicted = nullptr;;//预测器
+            delete pnpSolver_gravity; // 删除对象
+            pnpSolver_gravity = nullptr;;//重力补偿器
+            return false;
+        }
+
+        //初始化中间变量
+        Identifies_center.clear();//识别结果中心容器
+        time_milliseconds = 0;//计时(单位毫秒)
+        angle_diff_temp = 0;//差分角度
+        angle_diff.clear();//差分角度容器
+        angle_diff_time.clear();//时间容器
+        predicted_diff_angle = 0;//预测差分角
+        final_angle = 0;//最终角度(原角度加上预测角)
+        final_angle_2D = {0, 0};//最终角度对应的图像点
+        euler_angles = {0, 0};//储存发送的空间角
+
+        start = std::chrono::steady_clock::now();//时间基础
+
+        init = true;//完成初始化
+    }
+
+    // 帧计数，用于限频打印
+    //记录时间
+    std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();//首时间
+    std::chrono::steady_clock::duration time = end - start;//计算时间差
+    // 将时间差强制转为毫秒，获取数值
+    time_milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(time).count();//转换时间单位
+    //time_milliseconds = 1/fps__*1000+time_milliseconds;
+    //cout << "时间：" << time_milliseconds << endl;
+
+    std::chrono::steady_clock::time_point Identifies_start = std::chrono::steady_clock::now();
+    //识别
+    Identifies_center = Identifies->Identifies(frame);
+    if (Identifies_center.empty()){
+        cout << "识别结果中心容器为空！"<< endl;
+        return false;
+    }
+    std::chrono::steady_clock::time_point Identifies_end = std::chrono::steady_clock::now();//首时间
+    std::chrono::steady_clock::duration Identifies_time = Identifies_end - Identifies_start;//计算时间差
+    //cout << "识别时间：" << std::chrono::duration_cast<std::chrono::milliseconds>(Identifies_time).count() << endl;
+
+
+
+    std::chrono::steady_clock::time_point diff_start = std::chrono::steady_clock::now();
+    //预测前角度处理
+    //1. 传入风车、扇叶中心点等参数，计算扇叶当前旋转角度存入`angle_diff_temp`；
+    //2. 角度有效（不等于-1）：把角度、对应时间戳存入时序缓存，清空识别中心点；
+    //3. 角度计算失败（等于-1）：打印报错、清空中心点，直接退出函数。
+    angle_diff_temp = Angleprocess->pre_predict_angle_process(Identifies_center[0], Identifies_center[1], time_milliseconds, delta_t_, fps);//视频测试时用fps__，打符时用fps
+    if (angle_diff_temp != -1){
+        angle_diff.push_back(angle_diff_temp);
+        angle_diff_time.push_back(time_milliseconds);
+        Identifies_center.clear();//清除识别中心容器
+    }else{
+        //cout << "预测前角度处理结果容器为空！"<< endl;
+        Identifies_center.clear();//清除识别中心容器
+
+
+        // 角度差分计算失败
+        return false;
+    }
+    std::chrono::steady_clock::time_point diff_end = std::chrono::steady_clock::now();//首时间
+    std::chrono::steady_clock::duration diff_time = diff_end - Identifies_start;//计算时间差
+    //cout << "预测前角度时间：" << std::chrono::duration_cast<std::chrono::milliseconds>(diff_time).count() << endl;
+    // 角度差分完成
+
+
+    std::chrono::steady_clock::time_point predicted_start = std::chrono::steady_clock::now();
+    //预测
+    //1. 传入角度时序、时间戳、运动模式、预测时长、帧率，调用预测模块算出需要补偿的旋转提前角`predicted_diff_angle`；
+    //2. 若预测结果为0代表预测失效，打印报错并退出函数；非0则正常使用该补偿角度计算击打目标角度。
+    predicted_diff_angle = Predicted->predicted(angle_diff, angle_diff_time, MoveMode, delta_t_, fps);//视频测试时用fps__，打符时用fps
+    //输入历史角度 + 时间，拟合扇叶旋转角速度，算出需要提前打的补偿角度；
+    if (predicted_diff_angle == 0){
+        // cout << "预测角度结果为空！"<< endl;
+        return false;
+    }
+    std::chrono::steady_clock::time_point predicted_end = std::chrono::steady_clock::now();//首时间
+    std::chrono::steady_clock::duration predicted_time = predicted_end - Identifies_start;//计算时间差
+    //cout << "预测时间：" << std::chrono::duration_cast<std::chrono::milliseconds>(predicted_time).count() << endl;
+    // 预测完成
+
+
+    //预测后角度处理(转换为图像对应点)
+    //把预测后的目标极角，反向换算成图像上需要瞄准的装甲中心像素坐标，用于后续 PnP 解算三维角度。
+    final_angle = predicted_diff_angle + Angleprocess->angle_polar_now;
+    // final_angle = Angleprocess->angle_polar_now;
+    final_angle_2D = Angleprocess->post_predict_angle_process(final_angle, Angleprocess->radius_buff);
+        //cout << "x::" << final_angle_2D.x << endl;
+        //cout << "y:" << final_angle_2D.y << endl;
+    
+
+    //自动重力补偿
+    //获得补偿后的欧拉角。euler_angles.x是pitch，euler_angles.y是yaw。
+    std::chrono::steady_clock::time_point gravity_start = std::chrono::steady_clock::now();
+    euler_angles.x = 0;
+    euler_angles.y = 0;
+        //cout << "图像高:" << frame.rows << endl;
+        //cout << "图像宽:" << frame.cols << endl;
+        //根据预测瞄准点生成装甲四个角像素坐标；
+         //PnP 解算相机到装甲的相对俯仰、偏航弧度；
+//内置重力补偿，修正云台倾斜带来的解算偏移；
+    euler_angles = pnpSolver_gravity->PnPSolver_and_gravity(
+        cv::Point2f(final_angle_2D.x-Pretreatment->side*0.5,final_angle_2D.y+Pretreatment->side*0.5), //左下
+        cv::Point2f(final_angle_2D.x-Pretreatment->side*0.5,final_angle_2D.y-Pretreatment->side*0.5), //左上
+        cv::Point2f(final_angle_2D.x+Pretreatment->side*0.5,final_angle_2D.y-Pretreatment->side*0.5), //右上
+        cv::Point2f(final_angle_2D.x+Pretreatment->side*0.5,final_angle_2D.y+Pretreatment->side*0.5), //右下
+        RmSerialData.Pitch
+    );
+    //1. 控制台打印叠加补偿后的PnP原始水平、俯仰角度，方便调试查看补偿效果；
+    //2. 把最终计算好的云台水平、竖直控制角度装入ROS标准浮点调试消息；
+    //3. 通过调试发布器将角度数据发布到ROS话题，可借助可视化工具实时查看角度变化曲线；
+    //4. 通过正式指令发布器下发完整云台角度数据给电控下位机，控制云台转动瞄准预测后的扇叶目标
+    std::chrono::steady_clock::time_point gravity_end = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::duration gravity_time = gravity_end - Identifies_start;
+    //cout << "补偿时间：" << std::chrono::duration_cast<std::chrono::milliseconds>(gravity_time).count() << endl;//发送角度
+    if (euler_angles.x == 0 && euler_angles.y == 0 )
+    {
+        //cout << "角度发送失败" << endl;
+        return false;
+    }
+    else
+    {
+        //Angle.x：最终发给云台电机的目标俯仰角度=云台当前俯仰+pnp解算目标俯仰+俯仰补偿
+        Angle.x = -RmSerialData.Pitch+(euler_angles.x+pitch_compensation);//pnp
+        // double ty = 0.1;
+        // if (fabs(euler_angles.y) >= ty){
+        // if (euler_angles.y > 0.0)
+        // Angle.y = RmSerialData.Yaw + ty;
+        // else
+        // Angle.y = RmSerialData.Yaw - ty;
+        // }
+        // else
+        // Angle.y = RmSerialData.Yaw;
+        // Angle.y = RmSerialData.Yaw-euler_angles.y;//pnp
+        Angle.y = RmSerialData.Yaw+(euler_angles.y+yaw_compensation);
+        // Angle.y = -euler_angles.y;
+        // Angle.x = -RmSerialData.Pitch;
+        //Angle.y = RmSerialData.Yaw;
+        //Angle.x = -RmSerialData.Pitch;
+        //Angle.y = euler_angles.y;
+        Angle.z = 1;
+        //cout << "Angle.x" << (euler_angles.x+pitch_compensation) << endl;
+        //cout << "Angle.y" << (euler_angles.y+yaw_compensation) << endl;
+        std_msgs::Float64 debug_msg_x;
+        std_msgs::Float64 debug_msg_y;
+        //debug_msg_x（Float64）：观测俯仰 Pitch 角度，调弹道下坠补偿pitch_compensation；
+        //debug_msg_y（Float64）：观测偏航 Yaw 角度，调能量机关旋转预测、水平补偿yaw_compensation；
+        debug_msg_x.data = Angle.x;
+        debug_msg_y.data = Angle.y;
+        debugpub.publish(debug_msg_x);   // 发布俯仰调试话题
+        debugpub1.publish(debug_msg_y);  // 发布偏航调试话题
+        //调试工具使用：
+        //rqt_plot 订阅两个话题，实时画角度曲线；
+        //能量机关旋转时观察 Yaw 曲线滞后、抖动，优化预测滤波；
+        //调整pitch_compensation弹道补偿，看 Pitch 曲线命中效果。
+          
+        // ====================== 在这里插入打印 ======================
+        ROS_INFO("【下发电控】Pitch: %.2f ° | Yaw: %.2f °", Angle.x * 180 / M_PI, Angle.y * 180 / M_PI);
+      
+
+        PubAngle.publish(Angle);
+    }
+
+    // 重力补偿完成
+
+    //显示结果(数据可视化)
+    //打印预测点
+    circle(frame, final_angle_2D, 3, Scalar(0, 0, 255), -1);
+    //打印发射角度,时间间隔，发送角度
+    //cout << "delta_t_:" << delta_t_ << endl;
+    //cout << "相机pitch=" << euler_angles.x*180/PI << "  " << "相机yaw=" << euler_angles.y*180/PI << endl;
+    //cout << "发送补偿角度·:" << -RmSerialData.Pitch+-(euler_angles.x+pitch_compensation) *180 /PI << endl;
+    //打印帧率
+    //帧率显示参数
+    double fps_;
+    char buffer[10]; // 用于存放帧率的字符串
+    //这段代码统计每一帧图像处理消耗的时间，算出帧率 FPS；
+    //一方面用来排查代码卡顿、优化运行速度；
+    //另一方面给能量机关装甲旋转预测算法提供帧间隔 Δt，是预测命中必不可少的时间参数。
+    double fps_time_milliseconds = 0;
+    std::chrono::steady_clock::time_point fps_end = std::chrono::steady_clock::now();//首时间
+    std::chrono::steady_clock::duration fps_time = fps_end - fps_start;//计算时间差
+    fps_time_milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(fps_time).count();//转换时间单位
+    //cout << "运行总时间：" << fps_time_milliseconds << endl;
+    fps_ = 1.0 / (fps_time_milliseconds*0.001);
+    sprintf(buffer, "%.2f", fps_); // 帧率保留两位小数
+    std::string fpsString = "FPS:" + std::string(buffer); // 在"FPS:"后加入帧率数值字符串
+    cv::putText(frame, fpsString, cv::Point(10, 40), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(255, 255, 255));// 将帧率信息写在输出帧上l
+        // ========== 新增：预测点像素坐标 + 下发云台角度 ==========
+    char info_buf[150];
+    // 预测瞄准点像素XY
+    sprintf(info_buf, "Pred X:%d Y:%d", (int)final_angle_2D.x, (int)final_angle_2D.y);
+    cv::putText(frame, info_buf, cv::Point(10, 80), cv::FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0,0,255), 2);
+
+    // 发给电控的Pitch、Yaw角度（弧度转度方便看）
+    sprintf(info_buf, "Send Pitch:%.1f Yaw:%.1f", Angle.x*180/PI, Angle.y*180/PI);
+    cv::putText(frame, info_buf, cv::Point(10, 120), cv::FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0,255,255), 2);
+
+    return true;
+        
+    }else if(!functional){
+        // 装甲板模式: 不做任何处理, 保持已初始化的状态, 等切回大符模式时可直接恢复
+        return false;
+    }
+
+return false;
+}
+
+
+int main(int argc, char *argv[])
+{
+    ros::init(argc,argv,"Fu");
+    ros::NodeHandle nh;
+    ros::NodeHandle private_nh("~");
+
+    // ========== 加载 YOLO 模型 (路径通过 ROS param 配置) ==========
+    std::string r_model_path, fan_model_path;
+    private_nh.param<std::string>("r_model_path", r_model_path,
+        "Model/fu_moxi/R_best.onnx");
+    private_nh.param<std::string>("fan_model_path", fan_model_path,
+        "Model/fu_moxi/Fan_best.onnx");
+
+    ROS_INFO("[Fu] R   model: %s", r_model_path.c_str());
+    ROS_INFO("[Fu] Fan model: %s", fan_model_path.c_str());
+
+    R_Config   R_config   = {0.2, 0.3, 0.3, 640, 640, r_model_path};
+    Fan_Config Fan_config  = {0.2, 0.3, 0.3, 640, 640, fan_model_path};
+    yolofumodel  = new YOLOV8_R(R_config);
+    yoloFanmodel = new YOLOV8_Fan(Fan_config);
+
+    ros::Subscriber SubCamera = nh.subscribe("/hikrobot_camera/rgb", 1000, &doimage);
+    ros::Subscriber SubRmSerial = nh.subscribe("/RmSerialData", 1000, &doserial);
+    PubAngle = nh.advertise<geometry_msgs::Vector3>("/auto_angle",1000);
+    debugpub = nh.advertise<std_msgs::Float64>("/debugpub", 1000);
+    debugpub1 = nh.advertise<std_msgs::Float64>("/debugpub1", 1000);
+
+
+
+    while (ros::ok())
+    {
+        // // ROS_INFO("循环正在进行中");
+        // // cout<<"fu_task"<<endl;   
+                ros::spinOnce(); 
+        // cout << "11111111111111111111111111111111111111111111111111" << endl;
+        
+        //校正云台原始角度，封装后分两路发布：
+        //一路单独输出俯仰、偏航用于调试观测，一路下发完整三轴角度给电控控制云台追踪目标。
+        if(!Fu_Task()){
+            // 跟踪失败时的保底: 仅在打符模式下发布回传角度
+            // 装甲模式下不发布, 由 Tracker 节点通过 /auto_angle 负责
+            if(functional){
+                Angle.x = -RmSerialData.Pitch;
+                Angle.y = RmSerialData.Yaw;
+                Angle.z = 1;
+                std_msgs::Float64 debug_msg_x;
+                std_msgs::Float64 debug_msg_y;
+                debug_msg_x.data = Angle.x;
+                debug_msg_y.data = Angle.y;
+                debugpub.publish(debug_msg_x);
+                debugpub1.publish(debug_msg_y);
+                PubAngle.publish(Angle);
+            }
+        }
+
+
+        if (!frame.empty()) {
+            imshow("Image with Point", frame);
+            if (cv::waitKey(1) == 'q') {
+                return 0; // 按'q'键退出
+            }
+        }else{
+            // cout<<"fu_task222222"<<endl; 
+        }
+        // ros::spinOnce();
+        
+    }
+    
+    return 0;
+}

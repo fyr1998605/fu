@@ -1,0 +1,13 @@
+<!-- 原本的启动配置文件 -->
+<!-- <launch>
+    <node pkg="rm_identify" type="identify_test" name="identify" respawn="true" output="log" /> 
+</launch> -->
+
+<launch>
+    <node name="identify" pkg="rm_identify" type="identify_test" output="screen">
+        <!-- 设置配置文件路径参数 -->
+        <param name="armor_identify_config" 
+               type="string" 
+               value="$(find rm_identify)/config/rm_identify.yaml" />
+    </node>
+</launch>

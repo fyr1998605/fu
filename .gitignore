@@ -1,0 +1,11 @@
+build/
+devel/
+install/
+log/
+*.log
+*.bag
+.vscode/
+.idea/
+.marscode/
+*.swp
+*~
