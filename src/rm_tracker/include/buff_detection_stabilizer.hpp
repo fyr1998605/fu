@@ -29,6 +29,16 @@ public:
     explicit BuffDetectionStabilizer(float alpha = 0.9f)
         : alpha_(std::max(0.0f, std::min(1.0f, alpha))) {}
 
+    /// 时序关联参数注入 (由 BuffRecognizer::configure 从 Buff.recognition 载入)
+    void configure(float alpha, float assoc_gate_min_px, float assoc_gate_radius_ratio,
+                   int jump_confirm_frames, int reacquire_confirm_frames) {
+        alpha_ = std::max(0.0f, std::min(1.0f, alpha));
+        assoc_gate_min_px_ = std::max(0.0f, assoc_gate_min_px);
+        assoc_gate_radius_ratio_ = std::max(0.0f, assoc_gate_radius_ratio);
+        jump_confirm_frames_ = std::max(1, jump_confirm_frames);
+        reacquire_confirm_frames_ = std::max(1, reacquire_confirm_frames);
+    }
+
     // Returns the index of the best associated candidate, or -1 if no candidate
     // passes the spatial association gate. When has_previous is true and a gate
     // is set, a failed association is treated as a tracking loss — it does NOT
@@ -68,13 +78,10 @@ public:
         return nearest_index;
     }
 
-    static float associationGateForRadius(float radius_px) {
+    float associationGateForRadius(float radius_px) const {
+        // 原硬编码: max(20.0f, radius_px * 1.2f)
         // 1.2×radius covers adjacent-blade chord length (~1.18×radius).
-        // The old 0.45×radius gate rejected legitimate blade switches
-        // (108-130 px jumps) as false positives, causing temporal
-        // association failure → reacquisition stall → World EKF starved
-        // of observations after every power-rune light on.
-        return std::max(20.0f, radius_px * 1.2f);
+        return std::max(assoc_gate_min_px_, radius_px * assoc_gate_radius_ratio_);
     }
 
     // Confirm a persistent jump only after three consecutive consistent frames
@@ -92,8 +99,8 @@ public:
 
         if (candidatesAreNear(measurement, pending_jump_, association_gate_px)) {
             pending_jump_confirmations_++;
-            // Need 3 total consistent frames: 1 initial + 2 confirming matches
-            if (pending_jump_confirmations_ >= 2) {
+            // 需要 jump_confirm_frames_ 帧一致: 1 初始 + (N-1) 次确认 (默认 3 帧)
+            if (pending_jump_confirmations_ >= (jump_confirm_frames_ - 1)) {
                 has_pending_jump_ = false;
                 pending_jump_confirmations_ = 0;
                 return true;
@@ -190,6 +197,10 @@ private:
     }
 
     float alpha_;
+    float assoc_gate_min_px_ = 20.0f;      // 原 20.0
+    float assoc_gate_radius_ratio_ = 1.2f;  // 原 1.2
+    int   jump_confirm_frames_ = 3;         // 原 pending>=2 -> 共 3 帧
+    int   reacquire_confirm_frames_ = 3;    // 重捕获确认帧数(当前与跳变共用同机制)
     bool has_state_ = false;
     bool has_pending_jump_ = false;
     int  pending_jump_confirmations_ = 0;  // frames confirming the pending jump

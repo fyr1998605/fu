@@ -73,7 +73,7 @@ class FuConfigLayoutTest(unittest.TestCase):
                    "buff_node_runtime.hpp").read_text(encoding="utf-8")
 
         self.assertIn(
-            "const double raw_angle_x = -RmSerialData.Pitch + euler_angles.x + pitch_compensation;",
+            "raw_angle_x = -RmSerialData.Pitch + (euler_angles.x + pitch_compensation);",
             runtime,
         )
         self.assertNotIn(
@@ -81,21 +81,73 @@ class FuConfigLayoutTest(unittest.TestCase):
             runtime,
         )
 
-    def test_fan_pitch_fallback_holds_position_with_zero_correction(self):
+    def test_fan_pitch_failure_does_not_publish_stale_angle(self):
         runtime = (REPO_ROOT / "src" / "rm_tracker" / "include" /
                    "buff_node_runtime.hpp").read_text(encoding="utf-8")
 
-        self.assertIn("Angle.x = 0.0;", runtime)
-        self.assertNotIn("Angle.x = -RmSerialData.Pitch;", runtime)
+        self.assertIn("if (track_ok) {", runtime)
+        self.assertIn(
+            "debug_msg_x.data = track_ok ? Angle.x : -RmSerialData.Pitch;",
+            runtime,
+        )
 
     def test_world_tracker_latches_ready_state_across_short_bad_streaks(self):
         tracker = (REPO_ROOT / "src" / "rm_tracker" / "include" /
                    "buff_world_tracker.hpp").read_text(encoding="utf-8")
 
-        self.assertIn("kReadyEnterFrames = 3", tracker)
-        self.assertIn("kReadyExitFrames = 5", tracker)
-        self.assertIn("ready_good_frames_", tracker)
-        self.assertIn("ready_bad_frames_", tracker)
+        self.assertIn("kReadyEnterFrames = 10", tracker)
+        self.assertIn("kReadyExitFrames  = 15", tracker)
+        self.assertIn("ready_enter_counter_", tracker)
+        self.assertIn("ready_exit_counter_", tracker)
+
+    def test_buff_tracking_does_not_start_as_success(self):
+        runtime = (REPO_ROOT / "src" / "rm_tracker" / "include" /
+                   "buff_node_runtime.hpp").read_text(encoding="utf-8")
+
+        self.assertIn("bool track_ok = false;", runtime)
+        self.assertNotIn("bool track_ok = true;", runtime)
+
+    def test_buff_runtime_keeps_final_diagnostic_fields(self):
+        runtime = (REPO_ROOT / "src" / "rm_tracker" / "include" /
+                   "buff_node_runtime.hpp").read_text(encoding="utf-8")
+        for field in (
+            "raw_angle_x",
+            "limited_angle_x",
+            "pixel_track_ok",
+            "kalman_healthy",
+            "track_ok",
+            "last_reprojection_error_",
+        ):
+            self.assertIn(field, runtime)
+
+    def test_buff_pnp_exposes_last_reprojection_error_read_only(self):
+        pnp = (REPO_ROOT / "src" / "rm_tracker" / "include" /
+               "buff_pnp_solver.hpp").read_text(encoding="utf-8")
+
+        self.assertIn("double lastReprojectionError() const", pnp)
+        self.assertIn("return last_reprojection_error_;", pnp)
+
+    def test_buff_pnp_exposes_prediction_failure_diagnostics(self):
+        pnp = (REPO_ROOT / "src" / "rm_tracker" / "include" /
+               "buff_pnp_solver.hpp").read_text(encoding="utf-8")
+        runtime = (REPO_ROOT / "src" / "rm_tracker" / "include" /
+                   "buff_node_runtime.hpp").read_text(encoding="utf-8")
+
+        self.assertIn("lastPredictionFailureReason() const", pnp)
+        self.assertIn("lastPredictedTargetGun() const", pnp)
+        self.assertIn("last_gun_pitch_raw_deg_", pnp)
+        self.assertIn("[BUFF_PRED_FAIL]", pnp)
+        self.assertIn("prediction_fail_reason", runtime)
+        self.assertIn("gun_pitch_raw_deg", runtime)
+        self.assertIn("gun_yaw_deg", runtime)
+        self.assertIn("compensated_pitch_deg", runtime)
+        self.assertIn("beginPredictionFrame()", pnp)
+        self.assertIn("pnpSolver_gravity->beginPredictionFrame()", runtime)
+        self.assertIn('prediction_fail_reason != "ok"', runtime)
+        self.assertNotIn('cout<<"4444444444444"', runtime)
+        self.assertIn("[BUFF_WORLD_FAIL]", runtime)
+        self.assertNotIn('cout<<"2222222222222"', runtime)
+        self.assertNotIn('cout<<"3333333333333"', runtime)
 
 
 if __name__ == "__main__":

@@ -6,10 +6,13 @@ add_compile_options(-std=c++14)
 
 set(Eigen3_INCLUDE_DIRS ${EIGEN3_INCLUDE_DIR})
 
-# 关键修改：在 find_package 中添加 rm_msgs
+# 关键修改：在 find_package 中添加 rm_msgs 及哨兵串口所需消息包
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   std_msgs
+  sensor_msgs
+  geometry_msgs
+  tf2
   rm_msgs          # 添加这一行！
 )
 
@@ -21,7 +24,7 @@ find_package(Eigen3 REQUIRED)
 
 # 关键修改：在 catkin_package 中添加 rm_msgs
 catkin_package(
-  CATKIN_DEPENDS roscpp std_msgs rm_msgs    # 添加 rm_msgs
+  CATKIN_DEPENDS roscpp std_msgs sensor_msgs geometry_msgs tf2 rm_msgs    # 添加 rm_msgs
 )
 
 # 关键修改：添加 rm_msgs 到 include 目录

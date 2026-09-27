@@ -11,7 +11,6 @@ add_compile_options(-std=c++17)
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--disable-new-dtags")
 
 # ========== OpenCV 强制使用系统 4.2 ==========
-# 关键：指定正确的 cmake 配置目录，并用 NO_DEFAULT_PATH 忽略 /usr/local 下的 4.7
 set(OpenCV_DIR "/usr/lib/x86_64-linux-gnu/cmake/opencv4")
 find_package(OpenCV 4.2 REQUIRED COMPONENTS core imgproc highgui calib3d
              PATHS /usr
@@ -20,6 +19,9 @@ find_package(OpenCV 4.2 REQUIRED COMPONENTS core imgproc highgui calib3d
 
 # 第三方依赖
 find_package(Eigen3 REQUIRED)
+# 调试时可取消注释下一行，确认变量值
+# message(STATUS "EIGEN3_INCLUDE_DIRS = ${EIGEN3_INCLUDE_DIRS}")
+
 find_package(Ceres REQUIRED)
 find_package(yaml-cpp 0.6.2 REQUIRED)
 find_package(Protobuf REQUIRED)
@@ -36,20 +38,19 @@ find_package(catkin REQUIRED COMPONENTS
   rm_msgs
 )
 
-# 如果你的 Eigen3 确实安装在 /usr/local/eigen-3.4，可保留；否则可注释掉让 CMake 自动找
-set(Eigen3_DIR "/usr/local/eigen-3.4/share/eigen3/cmake")
+# ===== 修改1：注释掉错误的 Eigen3_DIR 设置 =====
+# set(Eigen3_DIR "/usr/local/eigen-3.4/share/eigen3/cmake")   # 原行，路径可能不存在
+# 让 CMake 自动查找系统 Eigen
 
 catkin_package(
   INCLUDE_DIRS include
   CATKIN_DEPENDS roscpp std_msgs tf2_ros tf2 cv_bridge image_transport sensor_msgs geometry_msgs rm_msgs
   DEPENDS OpenCV Eigen3 Ceres yaml-cpp Protobuf
-  # 注意：这里不能再写 rm_msgs，已经在 CATKIN_DEPENDS 中声明了
 )
 
-# OpenVINO 2024.4 自带 TBB 库路径（编译+运行都需找到 libtbb.so.12）
+# OpenVINO 2024.4 自带 TBB 库路径
 set(OPENVINO_TBB_DIR /opt/l_openvino_toolkit_ubuntu20_2024.4.0.16579.c3152d32c9c_x86_64/runtime/3rdparty/tbb/lib)
 link_directories(${OPENVINO_TBB_DIR})
-# 把 TBB 路径写入 RPATH，运行时不再找不到
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 set(OPENVINO_LIB_DIR /opt/l_openvino_toolkit_ubuntu20_2024.4.0.16579.c3152d32c9c_x86_64/runtime/lib/intel64)
 link_directories(${OPENVINO_LIB_DIR})
@@ -61,6 +62,7 @@ include_directories(
   ${catkin_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
   ${Eigen3_INCLUDE_DIRS}
+  /usr/include/eigen3            # ===== 修改2：显式添加系统 Eigen 头文件路径 =====
   ${CERES_INCLUDE_DIRS}
   ${yaml-cpp_INCLUDE_DIRS}
   ${Protobuf_INCLUDE_DIRS}
@@ -104,6 +106,8 @@ target_link_libraries(tracker
 add_executable(Fu
   src/Fu.cpp
   src/buff_recognizer.cpp
+  src/buff_zju_ransac.cpp
+  src/buff_big_ransac_predictor.cpp
   include/CoorConverter.cpp
 )
 add_dependencies(Fu
@@ -128,7 +132,7 @@ target_link_libraries(Fu
   /opt/l_openvino_toolkit_ubuntu20_2024.4.0.16579.c3152d32c9c_x86_64/runtime/lib/intel64/libopenvino.so
 )
 
-# ========== 识别器独立测试 (无串口依赖) ==========
+# ========== 识别器独立测试 ==========
 add_executable(buff_test
   src/buff_recognizer_test.cpp
   src/buff_recognizer.cpp
@@ -149,6 +153,23 @@ target_link_libraries(buff_test
 )
 
 if(CATKIN_ENABLE_TESTING)
+  # 纯 C++ 测试: 只依赖 yaml-cpp, 不需要 ROS/catkin 运行时
+  add_executable(buff_config_test
+    test/buff_config_test.cpp
+  )
+  target_include_directories(buff_config_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  # 注入真实配置文件路径: 测试会加载它并要求"零警告", 用来保证仓库里的
+  # rm_fu.yaml 与校验规则一致 (改了 yaml 忘了同步规则会在这里失败)
+  target_compile_definitions(buff_config_test
+    PRIVATE BUFF_FU_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/rm_fu.yaml"
+  )
+  target_link_libraries(buff_config_test
+    yaml-cpp
+  )
+  add_test(NAME buff_config_test COMMAND buff_config_test)
+
   add_executable(buff_detection_stabilizer_test
     test/buff_detection_stabilizer_test.cpp
   )
@@ -164,6 +185,53 @@ if(CATKIN_ENABLE_TESTING)
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
   add_test(NAME buff_prediction_geometry_test COMMAND buff_prediction_geometry_test)
+
+  add_executable(buff_zju_ransac_test
+    test/buff_zju_ransac_test.cpp
+    src/buff_zju_ransac.cpp
+  )
+  target_include_directories(buff_zju_ransac_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(buff_zju_ransac_test
+    ${catkin_LIBRARIES}
+    ${OpenCV_LIBS}
+  )
+  add_test(NAME buff_zju_ransac_test COMMAND buff_zju_ransac_test)
+
+  add_executable(buff_big_ransac_predictor_test
+    test/buff_big_ransac_predictor_test.cpp
+    src/buff_big_ransac_predictor.cpp
+    src/buff_zju_ransac.cpp
+  )
+  target_include_directories(buff_big_ransac_predictor_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(buff_big_ransac_predictor_test
+    ${catkin_LIBRARIES}
+    ${OpenCV_LIBS}
+  )
+  add_test(NAME buff_big_ransac_predictor_test COMMAND buff_big_ransac_predictor_test)
+
+  add_executable(buff_angle_processor_test
+    test/buff_angle_processor_test.cpp
+  )
+  target_include_directories(buff_angle_processor_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(buff_angle_processor_test
+    ${catkin_LIBRARIES}
+    ${OpenCV_LIBS}
+  )
+  add_test(NAME buff_angle_processor_test COMMAND buff_angle_processor_test)
+
+  add_executable(buff_move_mode_detector_test
+    test/buff_move_mode_detector_test.cpp
+  )
+  target_include_directories(buff_move_mode_detector_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  add_test(NAME buff_move_mode_detector_test COMMAND buff_move_mode_detector_test)
 endif()
 
 # 安装规则

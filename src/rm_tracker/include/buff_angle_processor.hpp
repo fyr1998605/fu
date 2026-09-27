@@ -1,5 +1,13 @@
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
+#include <cmath>
+#include <limits>
+#include <vector>
+
+#include "buff_config.hpp"
+
 // Persistent rotation direction that survives object re-creation.
 // +1 = clockwise (polar angle increases), -1 = counterclockwise, 0 = unset.
 extern int g_persistent_rotation_dir;
@@ -19,6 +27,7 @@ public:	//注：角度是指极坐标系下当前射线与x轴正方向夹角，
 	float angle_polar_back = 0;//极坐标前一角度
 	double last_angle_time_ms = 0;//上次处理的时间戳(ms), 用于检测帧丢失
 	float angle_polar_now = 0;//极坐标当前角度
+	bool last_frame_polar_valid = false;//本帧极角是否新鲜（图幅内且已刷新），供 RANSAC 采样与旧差分解耦
 	float radius_buff = 0;//能量机关的半径
 	bool anticlockwise = true; //默认逆时针为正方向
 	bool anticlockwise_flag = false;//方向是否判断成功
@@ -31,6 +40,22 @@ public:	//注：角度是指极坐标系下当前射线与x轴正方向夹角，
     vector<double> angle_time;//角度数组(用于判断旋转方向)
     double angle_diff = 0;//角度差分
     vector<double> angle_diff_vec;//差分角度容器
+
+    void set_image_size(const int width, const int height)
+    {
+        if (width > 0 && height > 0) {
+            image_width_ = width;
+            image_height_ = height;
+        }
+    }
+
+    // 角度处理参数注入 (Fu.cpp 从 Buff.angle 载入)。默认值 == 迁移前硬编码值。
+    void configure(const buff::AngleConfig& config)
+    {
+        angle_cfg_ = config;
+        image_width_ = config.image_width;
+        image_height_ = config.image_height;
+    }
 
 //polar_angle(circle_center, armor_center)
 //├─ 计算相对偏移 cartesian_x = 目标X - 圆心X
@@ -51,14 +76,19 @@ public:	//注：角度是指极坐标系下当前射线与x轴正方向夹角，
 		float cartesian_y = armor_center.y - circle_center.y;
 		float radius = sqrt(cartesian_x * cartesian_x + cartesian_y * cartesian_y);
 		this->radius_buff = radius;
+        if (!std::isfinite(radius) || radius <= 1e-6f) {
+            return std::numeric_limits<float>::quiet_NaN();
+        }
 		//判断坐标在哪个象限，根据象限加角度
 		cartesian_x >= 0 ? (x_flag = true) : (x_flag = false);
 		cartesian_y >= 0 ? (y_flag = true) : (y_flag = false);
 		//计算出当前直线与x轴的夹角
-		angle = acos(abs(cartesian_x) / radius);
+		const float ratio = std::clamp(abs(cartesian_x) / radius, 0.0f, 1.0f);
+		angle = acos(ratio);
 		x_flag ? (y_flag ? (theta = angle + 0) : (theta = 1.5 * PI + (0.5 * PI - angle))) : (y_flag ? (theta = 0.5 * PI + (0.5 * PI - angle)) : (theta = angle + 1 * PI));
 		//cout << theta * (180 / PI) << endl;
-		return theta;
+		return std::isfinite(theta)
+            ? theta : std::numeric_limits<float>::quiet_NaN();
 	}
 
 	//用于自动识别能量机关圆盘整体旋转方向（顺时针 / 逆时针），只在角度缓存积累满 21 组数据时完成一次判断，判定后永久锁定方向不再重复计算。
@@ -75,15 +105,17 @@ public:	//注：角度是指极坐标系下当前射线与x轴正方向夹角，
 			std::cout << "方向从持久存储中恢复: " << (this->anticlockwise ? "正转(clockwise)" : "反转(counterclockwise)") << std::endl;
 			return;
 		}
-		if (this->trun_count.size() < 21) this->trun_count.push_back(angle);
+		if (this->trun_count.size() < static_cast<std::size_t>(angle_cfg_.direction_judge_samples))
+			this->trun_count.push_back(angle);
 
-		if (this->trun_count.size() == 21 && this->anticlockwise_flag == false)
+		if (this->trun_count.size() == static_cast<std::size_t>(angle_cfg_.direction_judge_samples) &&
+			this->anticlockwise_flag == false)
 		{
             vector<double> angle_filter;//角度滤波函数
             for (int i = 1; i < trun_count.size(); i++)
             {
                 //除去突变差分角(角度相邻间隔不超过5度)
-                if (abs(trun_count[i] - trun_count[i-1]) < PI*0.028){
+                if (abs(trun_count[i] - trun_count[i-1]) < PI * angle_cfg_.direction_filter_ratio){
                     angle_filter.push_back(trun_count[i]);
                 }
             }
@@ -136,12 +168,13 @@ public:	//注：角度是指极坐标系下当前射线与x轴正方向夹角，
     //最终输出连续无跳变的累计角度，用于后续滤波、测速、瞄准计算
 	float angle2kf(float angle)
 	{
-		
+		this->angle_now = angle;//后一角度（原先从未被赋值，下方 angle_now==0 条件恒真）
+		this->angle_ = angle;//[FIX] 把当前测量写入累积角，使下方圈数/值域修正作用于真实测量
 		if (this->angle_now == 0 && !this->anticlockwise && this->anticlockwise_flag)//反转
 		{
-			angle_ = angle_ - 6.283185;//顺时针旋转时做角度值域修正
+			angle_ = angle_ - angle_cfg_.wrap_period;//顺时针旋转时做角度值域修正
 		}
-		else if (!this->anticlockwise && this->anticlockwise_flag) angle_ = angle_ - 6.283185;
+		else if (!this->anticlockwise && this->anticlockwise_flag) angle_ = angle_ - angle_cfg_.wrap_period;
 		// cout << "angle " << angle_ << endl;
 		if (!this->first_angle)
 		{
@@ -154,19 +187,19 @@ public:	//注：角度是指极坐标系下当前射线与x轴正方向夹角，
 				if (this->first_angle)//是第一个角度，且进入加圈状态
 				{
 					loop_count--;//配合逆时针旋转的角度跳变规则，修正累计圈数。
-					angle_ = angle_ + 6.283185 * (loop_count + 1);//6.283185（一整圈 360°）
+					angle_ = angle_ + angle_cfg_.wrap_period * (loop_count + 1);//wrap_period 即一整圈 360°
 					loop_add_flag = true;
 				}
 				else
 				{
-					angle_ = angle_ + 6.283185 * (loop_count + 1);
+					angle_ = angle_ + angle_cfg_.wrap_period * (loop_count + 1);
 					loop_add_flag = true;
 				}
 				// cout << "1" << endl;
 			}
-			else if (angle_ >= 6.195918 && angle_ <= 6.283185)//355 <= x <= 360
+			else if (angle_ >= 6.195918 && angle_ <= angle_cfg_.wrap_period)//355 <= x <= 360
 			{
-				angle_ = angle_ + 6.283185 * loop_count;
+				angle_ = angle_ + angle_cfg_.wrap_period * loop_count;
 				loop_add_flag = false;
 				// cout << "2" << endl;
 			}
@@ -178,11 +211,11 @@ public:	//注：角度是指极坐标系下当前射线与x轴正方向夹角，
 					loop_add_flag = false;
 					// cout << "true3" << endl;
 				}
-				angle_ = angle_ + 6.283185 * loop_count;
+				angle_ = angle_ + angle_cfg_.wrap_period * loop_count;
 				if (this->angle_include >= 1.047197 && this->angle_include <= 5.232986 && this->angle_polar_back > this->angle_polar_now)//若跳到之前的角后，则相当于再转了一圈
 				{
 					loop_count++;
-					angle_ = angle_ + 6.283185 * loop_count;
+					angle_ = angle_ + angle_cfg_.wrap_period * loop_count;
 				}
 				// cout << "3" << endl;
 			}
@@ -196,18 +229,18 @@ public:	//注：角度是指极坐标系下当前射线与x轴正方向夹角，
 				if (this->first_angle)
 				{
 					loop_count--;
-					angle_ = angle_ - 6.283185 * (loop_count + 1);
+					angle_ = angle_ - angle_cfg_.wrap_period * (loop_count + 1);
 					loop_add_flag = true;
 				}
 				else
 				{
-					angle_ = angle_ - 6.283185 * (loop_count + 1);
+					angle_ = angle_ - angle_cfg_.wrap_period * (loop_count + 1);
 					loop_add_flag = true;
 				}
 			}
-			else if (angle_ <= -6.195918 && angle_ >= -6.283185)//-360 <= x <=-355
+			else if (angle_ <= -6.195918 && angle_ >= -angle_cfg_.wrap_period)//-360 <= x <=-355
 			{
-				angle_ = angle_ - 6.283185 * loop_count;
+				angle_ = angle_ - angle_cfg_.wrap_period * loop_count;
 				loop_add_flag = false;
 			}
 			else if (angle_ < -0.5235986 && angle_ > -6.195918)//-355 < x < -30
@@ -217,11 +250,11 @@ public:	//注：角度是指极坐标系下当前射线与x轴正方向夹角，
 					loop_count++;
 					loop_add_flag = false;
 				}
-				angle_ = angle_ - 6.283185 * loop_count;
+				angle_ = angle_ - angle_cfg_.wrap_period * loop_count;
 				if (this->angle_include >= 1.047197 && this->angle_include <= 5.232986 && angle_polar_back < this->angle_polar_now)//若跳到之前的角后，则相当于再转了一圈
 				{
 					loop_count++;
-					angle_ = angle_ - 6.283185 * loop_count;
+					angle_ = angle_ - angle_cfg_.wrap_period * loop_count;
 				}
 			}
 		}
@@ -239,50 +272,71 @@ public:	//注：角度是指极坐标系下当前射线与x轴正方向夹角，
     //同时做三层校验：数据量校验、时间间隔超时校验、360° 跨圈角度跳变矫正；
     //最终输出「过去 delta_t 时间内风车转过的角度差」，用来计算平均角速度 ω = angle_diff /delta_t，是能量机关旋转预测的核心输入。
     double angle_diff_fun(const double delta_t, const double fps) {
-        if (this->angle_time.size() < fps * delta_t) {//fps * delta_t这段时长内对应的总帧数
-            // cout << "数据不足" << endl;
-            return -50; // 数据不够
+        // Keep the legacy correction rules, but select only indices that have
+        // two neighbors on each side for the five-point average.
+        if (!std::isfinite(delta_t) || !std::isfinite(fps) ||
+            delta_t <= 0.0 || fps <= 0.0 ||
+            angle_date.size() != angle_time.size() || angle_time.size() < 5 ||
+            fps * delta_t > static_cast<double>(std::numeric_limits<int>::max()) ||
+            angle_time.size() < fps * delta_t) {
+            return -50;
         }
-    //angle_time[size-i]：i 帧之前的时间戳
-        for (int i = static_cast<int>(fps*delta_t*0.5); i<=this->angle_time.size(); i++) {
-            if (this->angle_time.back()-this->angle_time[this->angle_time.size()-i] > delta_t*1000+80) { // 上限为德尔塔T+0.5秒
-                // std::cout << "差分时间超时！可能目标丢失" << std::endl;
+        const int sample_count = static_cast<int>(angle_time.size());
+        const int first_offset = std::max(
+            2, static_cast<int>(fps * delta_t * angle_cfg_.diff_search_start_ratio));
+        for (int offset = first_offset; offset <= sample_count - 3; ++offset) {
+            const int target_index = sample_count - 1 - offset;
+            if (target_index < 2 || target_index + 2 >= sample_count) {
+                continue;
+            }
+            const double elapsed = angle_time.back() - angle_time[target_index];
+            if (!std::isfinite(elapsed) || elapsed < 0.0 ||
+                elapsed > delta_t * 1000.0 + angle_cfg_.diff_timeout_margin_ms) {  // 原 + 80.0
                 return -50;
             }
-            //单纯用帧数算时间会出错（丢帧、卡顿、帧率不稳），所以循环不断增加 i，往更早的历史里找
-            if (this->angle_time.back()-this->angle_time[this->angle_time.size()-i] >= delta_t*1000) {
-                //cout << "差分数据下标：" << this->angle_time.size() << "  " << this->angle_time.size()-i+1 << endl;
-                //this->angle_diff = this->angle_date.back()-this->angle_date[this->angle_date.size()-i];//数据不局部平滑
-                // 5点均值平滑代替单帧角度，降噪
-                this->angle_diff = this->angle_date.back()-(this->angle_date[this->angle_date.size()-i]+this->angle_date[this->angle_date.size()-i-1]+this->angle_date[this->angle_date.size()-i+1]+this->angle_date[this->angle_date.size()-i-2]+this->angle_date[this->angle_date.size()-i+2])/5;
-                // cout << "差分时间：" << this->angle_time.back()-this->angle_time[this->angle_time.size()-i+1] << endl;
-                // cout << "差分角：" << this->angle_diff << endl;
-                if ((std::abs(this->angle_diff)>1.169 || (anticlockwise && this->angle_diff<0) || (!anticlockwise && this->angle_diff>0)) && this->anticlockwise_flag) { // 差分角大于67度则判断是否异常和判断正逆时针的差分角大于小于零,可能为扇页跳变
-                    for (int j = -6; j <= 6; j++) { // 使用不同的索引以避免与外部循环冲突
-                        if (this->anticlockwise && (angle_diff-(2*j*PI/5))<(2*PI/6.55) && (angle_diff-(2*j*PI/5))> -1e-9) { // 补角误差达到58度以下则返回补角(顺时针)
-                            cout << "矫正后差分的角度:" << ((angle_diff)-(2*j*PI/5)) << endl;
-                            return angle_diff-(2*j*PI/5);
-                        }else if (!this->anticlockwise && (angle_diff-(2*j*PI/5))>(-2*PI/6.55) && (angle_diff-(2*j*PI/5))< 1e-9){// 补角误差达到58度以下则返回补角(逆时针)
-                            cout << "矫正后差分的角度:" << ((angle_diff)-(2*j*PI/5)) << endl;
-                            return angle_diff-(2*j*PI/5);
+            if (elapsed >= delta_t * 1000.0) {
+                angle_diff = angle_date.back() -
+                    (angle_date[target_index] + angle_date[target_index - 1] +
+                     angle_date[target_index + 1] + angle_date[target_index - 2] +
+                     angle_date[target_index + 2]) / 5.0;
+                if (!std::isfinite(angle_diff)) {
+                    return -50;
+                }
+                if ((std::abs(angle_diff) > angle_cfg_.diff_angle_limit_rad ||  // 原 1.169
+                     (anticlockwise && angle_diff < 0.0) ||
+                     (!anticlockwise && angle_diff > 0.0)) &&
+                    anticlockwise_flag) {
+                    for (int correction = -angle_cfg_.sector_search_range;
+                         correction <= angle_cfg_.sector_search_range; ++correction) {  // 原 ±6
+                        const double corrected = angle_diff -
+                            2.0 * correction * PI / angle_cfg_.blade_count;          // 原 / 5.0
+                        if (anticlockwise &&
+                            corrected < 2.0 * PI / angle_cfg_.unwrap_tolerance_divisor &&  // 原 / 6.55
+                            corrected > -1e-9) {
+                            return corrected;
+                        }
+                        if (!anticlockwise &&
+                            corrected > -2.0 * PI / angle_cfg_.unwrap_tolerance_divisor &&  // 原 / 6.55
+                            corrected < 1e-9) {
+                            return corrected;
                         }
                     }
-                    // cout << "差分异常" << endl;
-                    return -50; // 异常
-                } else {
-                    // cout << "差分的角度：" << this->angle_diff << endl;
-                    return this->angle_diff;
-
+                    return -50;
                 }
+                return angle_diff;
             }
         }
-        cout << "差分异常" << endl;
-        return -50; // 异常
-    }
+        return -50;
 
+    }
     //传入角度和半径，得到x,y坐标
 	cv::Point2f x_y_cal(const double &angle, const double &radius)
 	{
+		if (!std::isfinite(angle) || !std::isfinite(radius) ||
+			!std::isfinite(point_center_back.x) || !std::isfinite(point_center_back.y)) {
+			const float nan = std::numeric_limits<float>::quiet_NaN();
+			return cv::Point2f(nan, nan);
+		}
 		Eigen::MatrixXf point2d_(2, 1);//二维像素坐标向量
 		Eigen::MatrixXf radius_matrix(2, 2);
 		Eigen::MatrixXf angel_matrix(2, 1);//角度+角速度状态向量
@@ -304,12 +358,18 @@ public:	//注：角度是指极坐标系下当前射线与x轴正方向夹角，
 	double pre_predict_angle_process(const cv::Point2f &circle_center, const cv::Point2f &armor_center,const double &time, const double &delta_t, const double &fps)
 	{
 		float angle = 0;
+		if (!std::isfinite(time) || !std::isfinite(delta_t) ||
+			!std::isfinite(fps) || delta_t <= 0.0 || fps <= 0.0) {
+			this->last_frame_polar_valid = false;
+			return -1;
+		}
+		this->last_frame_polar_valid = false;//默认本帧极角不可用，仅在图幅内且完成刷新后置真
 		//判断数据是否丢帧,点的值是否都是在图幅内
 		if (
-			(circle_center.x > 0 && circle_center.x <= 1280) &&
-			(circle_center.y > 0 && circle_center.y <= 1024) &&
-			(armor_center.x > 0 && armor_center.x <= 1280) &&
-			(armor_center.y > 0 && armor_center.y <= 1024)
+			(circle_center.x > 0 && circle_center.x <= image_width_) &&
+			(circle_center.y > 0 && circle_center.y <= image_height_) &&
+			(armor_center.x > 0 && armor_center.x <= image_width_) &&
+			(armor_center.y > 0 && armor_center.y <= image_height_)
 			)
 		{
 			//保留了圆心点
@@ -320,16 +380,45 @@ public:	//注：角度是指极坐标系下当前射线与x轴正方向夹角，
 				this->first_angle = true;
 				this->angle_polar_back = 0;
 			}
-			this->last_angle_time_ms = time;
 			this->point_center_back.x = circle_center.x;
 			this->point_center_back.y = circle_center.y;
+			if (!std::isfinite(circle_center.x) || !std::isfinite(circle_center.y) ||
+				!std::isfinite(armor_center.x) || !std::isfinite(armor_center.y)) {
+				return -1;
+			}
 			angle = this->polar_angle(circle_center, armor_center);//极坐标系下角度
 			this->angle_polar_now = angle; // 保存当前极角，供预测+叉乘检测使用
+			if (!std::isfinite(angle) || !std::isfinite(this->radius_buff)) {
+				this->last_frame_polar_valid = false;
+				return -1;
+			}
+			this->last_angle_time_ms = time;
+			this->last_frame_polar_valid = true;//本帧极角已刷新，RANSAC 可采样
 			this->turn(angle);//判断正反转
 			angle = this->angle2kf(angle);//得到可以累加的角度
 			//cout << "累加的角度：" << angle/PI << "PI" << endl;;
             this->angle_date.push_back(angle);//储存角度
             this->angle_time.push_back(time);//储存对应时间
+            // Keep the two legacy buffers paired. If an external caller
+            // changed one public buffer, the old `&&` trim condition could
+            // leave a permanent length mismatch and invalidate future
+            // angle_diff_fun calls.
+            if (this->angle_date.size() > this->angle_time.size()) {
+                this->angle_date.erase(
+                    this->angle_date.begin(),
+                    this->angle_date.begin() + static_cast<std::ptrdiff_t>(
+                        this->angle_date.size() - this->angle_time.size()));
+            } else if (this->angle_time.size() > this->angle_date.size()) {
+                this->angle_time.erase(
+                    this->angle_time.begin(),
+                    this->angle_time.begin() + static_cast<std::ptrdiff_t>(
+                        this->angle_time.size() - this->angle_date.size()));
+            }
+            while (this->angle_date.size() >
+                   static_cast<std::size_t>(angle_cfg_.angle_buffer_len)) {  // 原 300
+                this->angle_date.erase(this->angle_date.begin());
+                this->angle_time.erase(this->angle_time.begin());
+            }
             this->angle_diff = angle_diff_fun(delta_t, fps);//获得差分角
 			//cout << "差分的角度：" << this->angle_diff << endl;;
             if (this->angle_diff != -50){//判断差分角是否正确
@@ -366,6 +455,9 @@ public:	//注：角度是指极坐标系下当前射线与x轴正方向夹角，
 	}
 
 private:
-
+    // 角度处理参数 (默认值 == 迁移前硬编码值)
+    buff::AngleConfig angle_cfg_;
+    int image_width_ = 1280;
+    int image_height_ = 1024;
 };
 

@@ -300,7 +300,7 @@ private:
         } else {
             ROS_WARN("Camera config file not found, using default parameters");
             // 默认相机内参（根据实际相机调整）
-            camera_matrix_ = (cv::Mat_<double>(3,3) << 1692.72620365811, 0.363957161762693, 643.964129877484, 0, 1692.43288845269, 502.492890249832, 0, 0, 1);
+            camera_matrix_ = (cv::Mat_<double>(3,3) << 1329.24429634650, 0.518156995670085, 661.300343956123, 0, 1325.89618530323, 452.645884191168, 0, 0, 1);
         }
         coorConverter = new CoordinateTransformer(config_path_);
         m_MPC = std::make_shared<MPC>(config_path_);

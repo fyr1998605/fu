@@ -17,6 +17,7 @@ add_message_files(
   ArmorArray.msg
   Debug.msg
   RmSerial.msg
+  SentrySerial.msg 
 )
 
 generate_messages(

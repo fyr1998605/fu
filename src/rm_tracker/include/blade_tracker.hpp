@@ -8,6 +8,8 @@
 #include <array>
 #include <cmath>
 
+#include "buff_config.hpp"
+
 // 单个扇叶跟踪器
 struct BladeTracker {
     int id;                     // 唯一ID
@@ -86,17 +88,10 @@ struct BladeTracker {
 class SmallBuffPhaseTracker {
 public:
     static constexpr double kBladePeriod = 2.0 * CV_PI / 5.0;
-    static constexpr int kConvergeDelay = 5;
-    static constexpr double kMaxRollResidual = 0.55;
-    // Minimum enforced speed: reduced from 0.523 rad/s (30°/s) to 0.052 rad/s (~3°/s).
-    // The original value forced predictions to always move at ≥30°/s, causing the
-    // predicted point to drift along the circle even when the target was stationary.
-    // A small non-zero floor prevents the Kalman from stalling during brief occlusions
-    // but does not create large prediction errors for static targets.
-    static constexpr double kMinSmallBuffSpeed = 0.052;
-    static constexpr double kMaxSmallBuffSpeed = 1.571;
-    static constexpr double kPhaseProcessNoise = 0.005;//
-    static constexpr double kPhaseMeasurementNoise = 0.004;
+    // 其余常量已参数化 -> Buff.angle.small_buff_* (见 angle_cfg_)
+
+    // 小符相位跟踪参数注入 (Fu.cpp 从 Buff.angle 载入)。默认值 == 迁移前硬编码值。
+    void configure(const buff::AngleConfig& config) { angle_cfg_ = config; }
 
     bool update(const cv::Point2f& r_center,
                 const cv::Point2f& blade_center,
@@ -106,7 +101,8 @@ public:
         const cv::Point2f offset = blade_center - r_center;
         const double measured_radius = cv::norm(offset);
         if (!isFinitePoint(r_center) || !isFinitePoint(blade_center) ||
-            measured_radius < 1.0 || !std::isfinite(timestamp_seconds) ||
+            measured_radius < angle_cfg_.small_buff_min_radius_px ||   // 原 1.0
+            !std::isfinite(timestamp_seconds) ||
             !std::isfinite(predict_seconds) || predict_seconds < 0.0) {
             return false;
         }
@@ -123,11 +119,11 @@ public:
         }
 
         const double dt = timestamp_seconds - last_timestamp_;
-        if (dt <= 1e-4 || dt > 0.5) {
+        if (dt <= 1e-4 || dt > angle_cfg_.small_buff_max_dt) {  // 原 dt > 0.5
             // Partial reset: when the tracker was already locked, keep
             // direction and angular velocity — only re-initialize phase
             // from the new observation. A full reset would discard omega
-            // and force kConvergeDelay frames of re-convergence, causing
+            // and force angle_cfg_.small_buff_converge_delay frames of re-convergence, causing
             // prediction jumps of 8-160 px every time the target reappears
             // after a detection gap (e.g. power-rune light off→on).
             if (locked_direction_ != 0) {
@@ -137,12 +133,12 @@ public:
                 initializeKalman(raw_angle);
                 kalman_.statePost.at<double>(1, 0) =
                     saved_direction_ * std::max(
-                        kMinSmallBuffSpeed,
-                        std::min(kMaxSmallBuffSpeed,
+                        angle_cfg_.small_buff_min_speed,
+                        std::min(angle_cfg_.small_buff_max_speed,
                                  std::abs(saved_omega)));
                 // Tighten omega covariance — we trust the persisted value
-                kalman_.errorCovPost.at<double>(1, 1) = 0.02;
-                direction_votes_ = saved_direction_ * kConvergeDelay;
+                kalman_.errorCovPost.at<double>(1, 1) = angle_cfg_.small_buff_omega_reset_cov;  // 原 0.02
+                direction_votes_ = saved_direction_ * angle_cfg_.small_buff_converge_delay;
                 locked_direction_ = saved_direction_;
                 accepted_count_ = 0;
                 rejected_count_ = 0;
@@ -164,28 +160,30 @@ public:
         const double observed_phase = predicted_phase +
             wrapBladeDelta(raw_angle - predicted_phase);
         const double innovation = observed_phase - predicted_phase;
-        if (std::abs(innovation) > kMaxRollResidual) {
+        if (std::abs(innovation) > angle_cfg_.small_buff_max_roll_residual) {
             // Keep the predicted state for a short observation dropout.
             kalman_.statePost = kalman_.statePre.clone();
             kalman_.errorCovPost = kalman_.errorCovPre.clone();
             last_timestamp_ = timestamp_seconds;
             ROS_WARN_THROTTLE(0.3,
                 "[JITTER-KALMAN] REJECT: innovation=%.2f° > thr=%.2f°  raw=%.2f° pred=%.2f°  rejected=%d/3",
-                innovation * 180.0 / CV_PI, kMaxRollResidual * 180.0 / CV_PI,
+                innovation * 180.0 / CV_PI, angle_cfg_.small_buff_max_roll_residual * 180.0 / CV_PI,
                 raw_angle * 180.0 / CV_PI, predicted_phase * 180.0 / CV_PI,
                 rejected_count_ + 1);
-            if (++rejected_count_ > 3) reset();
+            if (++rejected_count_ > angle_cfg_.small_buff_reject_reset_count) reset();  // 原 > 3
             return false;
         }
 
         const double phase_delta = observed_phase - last_observed_phase_;
-        if (std::abs(phase_delta) > 0.002) {
+        if (std::abs(phase_delta) > angle_cfg_.small_buff_vote_min_phase_delta) {  // 原 0.002
             direction_votes_ += phase_delta > 0.0 ? 1 : -1;
-            direction_votes_ = std::max(-20, std::min(20, direction_votes_));
+            direction_votes_ = std::max(-angle_cfg_.small_buff_vote_saturation,
+                                        std::min(angle_cfg_.small_buff_vote_saturation,
+                                                 direction_votes_));  // 原 ±20
         }
 
-        const int direction = direction_votes_ >= kConvergeDelay ? 1 :
-                              direction_votes_ <= -kConvergeDelay ? -1 : 0;
+        const int direction = direction_votes_ >= angle_cfg_.small_buff_converge_delay ? 1 :
+                              direction_votes_ <= -angle_cfg_.small_buff_converge_delay ? -1 : 0;
 
         cv::Mat measurement(1, 1, CV_64F);
         measurement.at<double>(0, 0) = observed_phase;
@@ -195,8 +193,9 @@ public:
         // a hardcoded constant. Use linear fit over recent phase/timestamp pairs.
         if (direction != 0 && locked_direction_ == 0) {
             locked_direction_ = direction;
-            double computed_omega = kMinSmallBuffSpeed;  // floor fallback
-            if (phase_history_.size() >= 5) {
+            double computed_omega = angle_cfg_.small_buff_min_speed;  // floor fallback
+            if (phase_history_.size() >=
+                static_cast<std::size_t>(angle_cfg_.small_buff_omega_fit_min_samples)) {  // 原 >= 5
                 double sum_dphase = 0.0, sum_dt = 0.0;
                 for (size_t i = 1; i < phase_history_.size(); i++) {
                     double dp = phase_history_[i] - phase_history_[i - 1];
@@ -210,26 +209,42 @@ public:
                     computed_omega = std::abs(sum_dphase / sum_dt);
                 }
             }
-            computed_omega = std::max(kMinSmallBuffSpeed,
-                std::min(kMaxSmallBuffSpeed, computed_omega));
+            computed_omega = std::max(angle_cfg_.small_buff_min_speed,
+                std::min(angle_cfg_.small_buff_max_speed, computed_omega));
             kalman_.statePost.at<double>(1, 0) = direction * computed_omega;
-            kalman_.errorCovPost.at<double>(1, 1) = 0.05;
+            kalman_.errorCovPost.at<double>(1, 1) = angle_cfg_.small_buff_omega_locked_cov;  // 原 0.05
         }
 
         if (locked_direction_ != 0) {
             double omega = kalman_.statePost.at<double>(1, 0);
             if (omega * locked_direction_ <= 0.0) {
-                omega = locked_direction_ * kMinSmallBuffSpeed;
+                omega = locked_direction_ * angle_cfg_.small_buff_min_speed;
             } else {
                 omega = locked_direction_ * std::max(
-                    kMinSmallBuffSpeed,
-                    std::min(kMaxSmallBuffSpeed, std::abs(omega)));
+                    angle_cfg_.small_buff_min_speed,
+                    std::min(angle_cfg_.small_buff_max_speed, std::abs(omega)));
             }
             kalman_.statePost.at<double>(1, 0) = omega;
         }
 
-        radius_ = 0.9 * radius_ + 0.1 * measured_radius;
-        center_ = center_ * 0.8f + r_center * 0.2f;
+        // 原 0.9*radius_ + 0.1*measured_radius / 0.8f*center_ + 0.2f*r_center
+        radius_ = (1.0 - angle_cfg_.small_buff_radius_ema) * radius_ +
+                  angle_cfg_.small_buff_radius_ema * measured_radius;
+        // R 中心瞬跳时直接吸附, 不要走 EMA。
+        // predicted_center = center_ + radius_*unit(phase), 所以
+        // predicted_radius = (center_ - r_center) + radius_*unit(phase) ——
+        // center_ 落后观测值越远, 第一项越主导方向。上机日志抓到过
+        // center=(653,391) r_center=(651,280) radius=110.9px (相差 ~1 个半径),
+        // 此时预测点被甩到圆的另一侧, 下游 PnPSolver 以 physical_phase_limit 拒绝
+        // (image_phase_deg ≈ ±175°), 整帧作废。
+        const double center_shift = cv::norm(r_center - center_);
+        if (radius_ > 1e-6 &&
+            center_shift > angle_cfg_.small_buff_center_snap_ratio * radius_) {
+            center_ = r_center;
+        } else {
+            center_ = center_ * static_cast<float>(1.0 - angle_cfg_.small_buff_center_ema) +
+                      r_center * static_cast<float>(angle_cfg_.small_buff_center_ema);
+        }
         last_timestamp_ = timestamp_seconds;
         last_observed_phase_ = observed_phase;
         rejected_count_ = 0;
@@ -238,7 +253,8 @@ public:
         // Store phase/timestamp history for omega computation
         phase_history_.push_back(observed_phase);
         time_history_.push_back(timestamp_seconds);
-        while (phase_history_.size() > kPhaseHistoryMaxSize) {
+        while (phase_history_.size() >
+               static_cast<std::size_t>(angle_cfg_.small_buff_phase_history_max)) {  // 原 20
             phase_history_.pop_front();
             time_history_.pop_front();
         }
@@ -256,7 +272,7 @@ public:
 
         // Fast-track: saved direction bypasses converge delay after vision loss.
         if (locked_direction_ == 0) return false;
-        if (accepted_count_ < kConvergeDelay && saved_direction_ == 0) return false;
+        if (accepted_count_ < angle_cfg_.small_buff_converge_delay && saved_direction_ == 0) return false;
 
         const double phase = kalman_.statePost.at<double>(0, 0);
         const double omega = kalman_.statePost.at<double>(1, 0);
@@ -284,7 +300,7 @@ public:
 		time_history_.clear();
 		// Pre-seed direction votes from saved direction to speed up re-convergence.
 		if (saved_direction_ != 0) {
-			direction_votes_ = saved_direction_ * kConvergeDelay;
+			direction_votes_ = saved_direction_ * angle_cfg_.small_buff_converge_delay;
 
 		}
     }
@@ -299,10 +315,10 @@ private:
         kalman_.measurementMatrix = (cv::Mat_<double>(1, 2) << 1.0, 0.0);
         kalman_.statePost = (cv::Mat_<double>(2, 1) << phase, 0.0);
         kalman_.errorCovPost = (cv::Mat_<double>(2, 2) <<
-            0.10, 0.00,
-            0.00, 0.50);
+            angle_cfg_.small_buff_init_cov_phase, 0.00,     // 原 0.10
+            0.00, angle_cfg_.small_buff_init_cov_omega);    // 原 0.50
         kalman_.measurementNoiseCov = cv::Mat::eye(1, 1, CV_64F) *
-            kPhaseMeasurementNoise;
+            angle_cfg_.small_buff_phase_measurement_noise;
     }
 
     void configurePrediction(double dt) {
@@ -315,10 +331,10 @@ private:
         const double dt3 = dt2 * dt;
         const double dt4 = dt2 * dt2;
         kalman_.processNoiseCov = (cv::Mat_<double>(2, 2) <<
-            0.25 * dt4 * kPhaseProcessNoise,
-            0.50 * dt3 * kPhaseProcessNoise,
-            0.50 * dt3 * kPhaseProcessNoise,
-            dt2 * kPhaseProcessNoise);
+            0.25 * dt4 * angle_cfg_.small_buff_phase_process_noise,
+            0.50 * dt3 * angle_cfg_.small_buff_phase_process_noise,
+            0.50 * dt3 * angle_cfg_.small_buff_phase_process_noise,
+            dt2 * angle_cfg_.small_buff_phase_process_noise);
     }
 
     static double wrapBladeDelta(double delta) {
@@ -343,7 +359,8 @@ private:
     // Phase/timestamp history for computing angular velocity from observations
     std::deque<double> phase_history_;
     std::deque<double> time_history_;
-    static constexpr int kPhaseHistoryMaxSize = 20;
+    // 相位历史长度已参数化 -> Buff.angle.small_buff_phase_history_max
+    buff::AngleConfig angle_cfg_;   // 小符相位跟踪参数 (默认值=迁移前硬编码值)
 };
 
 /**

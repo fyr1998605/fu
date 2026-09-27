@@ -6,10 +6,9 @@
     <!-- 相机 -->
     <include file="$(find rm_hikcamera)/launch/rm_hikcamera.launch"/>
 
-    <!-- 串口 -->
+    <!-- 串口 (写死打符模式) -->
     <include file="$(find rm_serial)/launch/rm_serial.launch">
-        <arg name="shootflag_test" value="f" />
-        <arg name="camp_test"       value="r" />
+        <arg name="shootflag" value="f" />
     </include>
 
     <!-- 识别器 -->

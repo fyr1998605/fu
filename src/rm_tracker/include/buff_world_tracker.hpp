@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "buff_config.hpp"
+
 // World-frame observation of one power-rune target. All distances use meters.
 struct BuffWorldObservation {
     double stamp_seconds = 0.0;
@@ -34,13 +36,17 @@ class BuffWorldTracker {
 public:
     static constexpr double kPi = 3.14159265358979323846;
     static constexpr double kBladePeriod = 2.0 * kPi / 5.0;
-    // static constexpr double kMinSmallBuffOmega = 0.523;
-    static constexpr double kMinSmallBuffOmega = 0.15;
-    static constexpr double kMaxSmallBuffOmega = 1.571;
+    // kMinSmallBuffOmega / kMaxSmallBuffOmega 已参数化 -> Buff.world_tracker.min_omega / max_omega
 
     void configure(const BuffWorldTrackerConfig& config) {
         config_ = config;
         reset();
+    }
+
+    // 扩展配置注入 (Fu.cpp 从 Buff.world_tracker 载入内部门限/方向锁/ready 滞回等)。
+    // 默认值 == 迁移前硬编码值。
+    void configure(const buff::WorldTrackerConfig& extended) {
+        extended_ = extended;
     }
 
     void reset() {
@@ -52,7 +58,7 @@ public:
         radius_m_ = config_.radius_m;
         state_.setZero();
         covariance_.setIdentity();
-        covariance_ *= 1e3;
+        covariance_ *= extended_.init_covariance_scale;  // 原 1e3
         basis_u_map_ = Eigen::Vector3d::UnitX();
         basis_v_map_ = Eigen::Vector3d::UnitY();
         last_normal_map_ = Eigen::Vector3d::UnitZ();
@@ -73,7 +79,8 @@ public:
         }
 
         const double dt = observation.stamp_seconds - last_stamp_seconds_;
-        if (!std::isfinite(dt) || dt <= 1e-4 || dt > 1.0) {
+        if (!std::isfinite(dt) || dt <= extended_.min_dt_seconds ||   // 原 <= 1e-4
+            dt > extended_.max_dt_seconds) {                          // 原 > 1.0
             reset();
             initialize(observation, normal);
             return false;
@@ -87,42 +94,13 @@ public:
         const Eigen::Vector3d radial = projectToPlane(
             observation.target_center_map - rotor_plane_center, normal);
         const double observed_radius = radial.norm();
-        if (!std::isfinite(observed_radius) || observed_radius < 0.05) return false;
-
-        if (config_.radius_m <= 0.0) {
-            radius_m_ = radius_m_ <= 0.0 ? observed_radius
-                                         : 0.9 * radius_m_ + 0.1 * observed_radius;
-        }
+        if (!std::isfinite(observed_radius) || observed_radius < extended_.min_radius_m) return false;  // 原 < 0.05
 
         const double raw_phase = std::atan2(
             radial.dot(basis_v_map_), radial.dot(basis_u_map_));
         const double observed_phase = state_(5) +
             std::remainder(raw_phase - state_(5), kBladePeriod);
 
-        // ── 持续相位差分估计 omega（参照像素卡尔曼blade_tracker）──
-        // EKF 的 omega 状态没有直接观测，仅能通过相位残差间接推断，
-        // 收敛极慢。用相邻帧 raw_phase 差分直接估计 omega 并注入状态。
-        // 前 8 帧使用快速 EMA 初始化，之后用慢速 EMA 持续跟踪。
-        {
-            if (!init_phase_valid_) {
-                init_raw_phase_ = raw_phase;
-                init_stamp_ = observation.stamp_seconds;
-                init_phase_valid_ = true;
-            } else {
-                double phase_diff = std::remainder(raw_phase - init_raw_phase_, 2.0 * kPi);
-                double time_diff = observation.stamp_seconds - init_stamp_;
-                if (time_diff > 0.02 && std::isfinite(phase_diff)) {
-                    double est_omega = phase_diff / time_diff;
-                    est_omega = std::max(-kMaxSmallBuffOmega,
-                                  std::min(kMaxSmallBuffOmega, est_omega));
-                    // 初始化阶段快速收敛，后续慢速跟踪(≈1.5s时间常数)
-                    double alpha = (observation_count_ < 8) ? 0.7 : 0.03;
-                    state_(6) = (1.0 - alpha) * state_(6) + alpha * est_omega;
-                }
-                init_raw_phase_ = raw_phase;
-                init_stamp_ = observation.stamp_seconds;
-            }
-        }
         const Eigen::Vector2d normal_angles = normalToYawPitch(normal);
 
         Eigen::Matrix<double, 6, 1> measurement;
@@ -155,6 +133,61 @@ public:
 
         const Eigen::Matrix<double, 6, 6> innovation_covariance =
             h * covariance_ * h.transpose() + measurement_noise;
+
+        // ── 野值门限 ──
+        // 斜视时 PnP 深度可差出米级(z=4.4 vs 9.7m)。一次野值就能把
+        // center/omega 状态打飞("发散"), 观测噪声再大也挡不住。
+        // 逐维 Mahalanobis 门限: 任一分量超限则整帧丢弃(只推进时间戳)。
+        for (int index = 0; index < 6; ++index) {
+            const double sigma = std::sqrt(innovation_covariance(index, index));
+            if (std::abs(residual(index)) > extended_.residual_gate_sigma * sigma) {  // 原 kResidualGateSigma 3.5
+                last_stamp_seconds_ = observation.stamp_seconds;
+                last_normal_map_ = normal;
+                return ready_;
+            }
+        }
+
+        // 半径学习(仅 radius_mm=0 时生效)放在门限之后, 避免野值污染半径
+        if (config_.radius_m <= 0.0) {
+            radius_m_ = radius_m_ <= 0.0 ? observed_radius
+                                         : 0.9 * radius_m_ + 0.1 * observed_radius;
+        }
+
+        // ── 持续相位差分估计 omega（参照像素卡尔曼blade_tracker）──
+        // EKF 的 omega 状态没有直接观测，仅能通过相位残差间接推断，
+        // 收敛极慢。用相邻帧 raw_phase 差分直接估计 omega 并注入状态。
+        // 前 8 帧使用快速 EMA 初始化，之后用慢速 EMA 持续跟踪。
+        // 注意: 必须用与 observed_phase 一致的 72° 等效差分。识别器可能
+        // 切换到另一个扇叶(±k·72°), 若用 2π remainder, 别名残差折算出的
+        // est_omega 会直接夹到 ±1.571, 叠加 init 期大 alpha 导致重新锁定
+        // 后 omega 符号翻转(BUFF_WORLD omega 跳到 +0.5~+0.9 rad/s 的根因)。
+        {
+            if (!init_phase_valid_) {
+                init_raw_phase_ = raw_phase;
+                init_stamp_ = observation.stamp_seconds;
+                init_phase_valid_ = true;
+            } else {
+                double phase_diff = std::remainder(raw_phase - init_raw_phase_, kBladePeriod);
+                double time_diff = observation.stamp_seconds - init_stamp_;
+                if (time_diff > extended_.min_time_diff_seconds && std::isfinite(phase_diff)) {  // 原 > 0.02
+                    double est_omega = phase_diff / time_diff;
+                    est_omega = std::max(-extended_.max_omega,   // 原 -kMaxSmallBuffOmega
+                                  std::min(extended_.max_omega, est_omega));
+                    // 方向已锁定且样本明显反向: 判为噪声, 拒绝注入
+                    const bool contradicts_lock = locked_direction_ != 0 &&
+                        est_omega * locked_direction_ < -extended_.reverse_omega_reject_threshold;  // 原 -0.30
+                    if (!contradicts_lock) {
+                        // 初始化阶段快速收敛，后续慢速跟踪(≈1.5s时间常数)
+                        double alpha = (observation_count_ < extended_.omega_ema_fast_frames)  // 原 < 8
+                            ? extended_.omega_ema_fast : extended_.omega_ema_slow;             // 原 0.5 / 0.03
+                        state_(6) = (1.0 - alpha) * state_(6) + alpha * est_omega;
+                    }
+                }
+                init_raw_phase_ = raw_phase;
+                init_stamp_ = observation.stamp_seconds;
+            }
+        }
+
         const Eigen::Matrix<double, 7, 6> gain = covariance_ * h.transpose() *
             innovation_covariance.ldlt().solve(Eigen::Matrix<double, 6, 6>::Identity());
         state_ += gain * residual;
@@ -162,44 +195,44 @@ public:
         covariance_ = 0.5 * (covariance_ + covariance_.transpose());
 
         state_(3) = wrapNear(state_(3));
-        state_(4) = std::max(-kPi * 0.5 + 1e-3,
-                              std::min(kPi * 0.5 - 1e-3, state_(4)));
-        if (observation_count_ >= 4) {
-            state_(6) = std::max(-kMaxSmallBuffOmega,
-                                  std::min(kMaxSmallBuffOmega, state_(6)));
+        const double normal_pitch_limit = extended_.normal_pitch_limit_deg * kPi / 180.0;  // 原 90°
+        state_(4) = std::max(-normal_pitch_limit + 1e-3,
+                              std::min(normal_pitch_limit - 1e-3, state_(4)));
+        if (observation_count_ >= extended_.omega_clamp_start_frames) {  // 原 >= 4
+            state_(6) = std::max(-extended_.max_omega,
+                                  std::min(extended_.max_omega, state_(6)));
         }
 
         last_stamp_seconds_ = observation.stamp_seconds;
         last_normal_map_ = normal;
         ++observation_count_;
 
-        // ── 方向锁：|omega| ≥ 0.25 rad/s 连续 15 帧后锁定旋转方向 ──
-        // 锁定后 locked_direction_ 持久保留，reset 不会清除。
-        if (std::abs(state_(6)) >= kDirectionLockOmega) {
-            if (direction_lock_counter_ < kDirectionLockFrames)
+        // ── 方向锁：|omega| ≥ direction_lock_omega 连续 direction_lock_frames 帧后锁定 ──
+        if (std::abs(state_(6)) >= extended_.direction_lock_omega) {   // 原 0.25
+            if (direction_lock_counter_ < extended_.direction_lock_frames)  // 原 15
                 ++direction_lock_counter_;
-            if (direction_lock_counter_ >= kDirectionLockFrames && locked_direction_ == 0)
+            if (direction_lock_counter_ >= extended_.direction_lock_frames && locked_direction_ == 0)
                 locked_direction_ = (state_(6) > 0.0) ? 1 : -1;
         } else {
             direction_lock_counter_ = 0;
         }
 
-        // ── ready 滞回：条件连续满足 10 帧进入，连续不满足 15 帧退出 ──
-        const bool condition_ok = observation_count_ >= 5 &&
-            std::abs(state_(6)) >= kMinSmallBuffOmega;
+        // ── ready 滞回：条件连续满足 ready_enter_frames 帧进入，连续不满足 ready_exit_frames 帧退出 ──
+        const bool condition_ok = observation_count_ >= extended_.minimum_observations &&  // 原 >= 5
+            std::abs(state_(6)) >= extended_.min_omega;                                    // 原 kMinSmallBuffOmega
         if (condition_ok) {
             ready_exit_counter_ = 0;
-            if (ready_enter_counter_ < kReadyEnterFrames)
+            if (ready_enter_counter_ < extended_.ready_enter_frames)   // 原 10
                 ++ready_enter_counter_;
         } else {
             ready_enter_counter_ = 0;
-            if (ready_exit_counter_ < kReadyExitFrames)
+            if (ready_exit_counter_ < extended_.ready_exit_frames)     // 原 15
                 ++ready_exit_counter_;
         }
 
-        if (!ready_ && ready_enter_counter_ >= kReadyEnterFrames)
+        if (!ready_ && ready_enter_counter_ >= extended_.ready_enter_frames)
             ready_ = true;
-        else if (ready_ && ready_exit_counter_ >= kReadyExitFrames)
+        else if (ready_ && ready_exit_counter_ >= extended_.ready_exit_frames)
             ready_ = false;
 
         return ready_;
@@ -207,7 +240,7 @@ public:
 
     bool predictTarget(double future_seconds, Eigen::Vector3d& target_map) const {//预测未来目标位置
         if (!ready_ || !std::isfinite(future_seconds) || future_seconds < 0.0 ||
-            future_seconds > 1.0 || radius_m_ <= 0.0) {
+            future_seconds > extended_.max_prediction_seconds || radius_m_ <= 0.0) {  // 原 > 1.0
             return false;
         }
 
@@ -266,7 +299,7 @@ private:
             observation.r_center_map - config_.hub_normal_offset_m * normal;
         Eigen::Vector3d radial = projectToPlane(
             observation.target_center_map - rotor_plane_center, normal);
-        if (radial.norm() < 0.05) return;
+        if (radial.norm() < extended_.min_radius_m) return;  // 原 < 0.05
         radial.normalize();
 
         basis_u_map_ = radial;
@@ -280,7 +313,7 @@ private:
             square(0.20), square(0.20), square(0.20), square(0.50);
 		// Bias initial omega toward locked direction (实测 0.8~1.3 rad/s)。
 		if (locked_direction_ != 0) {
-			state_(6) = locked_direction_ * 0.9;
+			state_(6) = locked_direction_ * extended_.omega_init_abs;  // 原 * 0.9
 		}
         radius_m_ = config_.radius_m > 0.0 ? config_.radius_m :
             projectToPlane(observation.target_center_map - rotor_plane_center, normal).norm();
@@ -317,7 +350,7 @@ private:
         // 不足以阻止相位协方差坍塌。因此额外加入直接相位过程噪声下限，
         // 保证 K_phase 稳态 ≥ 0.10（对应 ~0.03 rad/s 的无观测相位漂移）。
         const double omega_var = square(config_.omega_process_std_radps2);
-        const double phase_process_noise_floor = 1.0e-5;  // rad²/frame
+        const double phase_process_noise_floor = extended_.phase_process_noise_floor;  // 原 1.0e-5 rad²/frame
         process_noise(5, 5) = std::max(
             (1.0 / 3.0) * dt * dt * dt * omega_var,
             phase_process_noise_floor);
@@ -337,6 +370,7 @@ private:
     }
 
     BuffWorldTrackerConfig config_;
+    buff::WorldTrackerConfig extended_;   // 内部门限/方向锁/ready 滞回等 (默认=迁移前硬编码)
     Eigen::Matrix<double, 7, 1> state_ = Eigen::Matrix<double, 7, 1>::Zero();
     Eigen::Matrix<double, 7, 7> covariance_ = Eigen::Matrix<double, 7, 7>::Identity();
     Eigen::Vector3d basis_u_map_ = Eigen::Vector3d::UnitX();
@@ -347,11 +381,7 @@ private:
     int observation_count_ = 0;
     bool initialized_ = false;
     bool ready_ = false;
-	// ── 方向锁与 ready 滞回 ──
-	static constexpr double kDirectionLockOmega = 0.25;   // rad/s
-	static constexpr int    kDirectionLockFrames = 15;
-	static constexpr int    kReadyEnterFrames = 10;
-	static constexpr int    kReadyExitFrames  = 15;
+    // ── 方向锁 / ready 滞回 / 野值门限 已参数化 -> Buff.world_tracker.* ──
 	int locked_direction_ = 0;        // -1=CCW, 0=unknown, +1=CW (persists across resets)
 	int direction_lock_counter_ = 0;
 	int ready_enter_counter_ = 0;

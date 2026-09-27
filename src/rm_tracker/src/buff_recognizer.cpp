@@ -2,6 +2,7 @@
 #include <ros/ros.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <random>
 
 // ============================================================================
@@ -11,21 +12,25 @@
 YoloBuffDetector::YoloBuffDetector(const std::string& model_path,
                                    float conf_threshold,
                                    float nms_threshold,
-                                   int   enemy_class)
+                                   int   enemy_class,
+                                   const std::string& model_device)
     : conf_threshold_(conf_threshold)
     , nms_threshold_(nms_threshold)
     , enemy_class_idx_(enemy_class)
 {
-    initModel(model_path);
+    initModel(model_path, model_device);
 }
 
-// 加载 OpenVINO 模型: read_model → compile_model(CPU) → create_infer_request
-void YoloBuffDetector::initModel(const std::string& model_path) {
-    ROS_INFO("[BuffRecognizer] 加载模型: %s", model_path.c_str());
+// 加载 OpenVINO 模型: read_model → compile_model(device) → create_infer_request
+void YoloBuffDetector::initModel(const std::string& model_path,
+                                 const std::string& model_device) {
+    ROS_INFO("[BuffRecognizer] 加载模型: %s (device=%s)",
+             model_path.c_str(), model_device.c_str());
     model_ = core_.read_model(model_path);
-    compiled_model_ = core_.compile_model(model_, "CPU");
+    compiled_model_ = core_.compile_model(model_, model_device);
     infer_request_ = compiled_model_.create_infer_request();
-    ROS_INFO("[BuffRecognizer] 模型加载成功, 输入shape: [1,3,640,640]");
+    ROS_INFO("[BuffRecognizer] 模型加载成功, 输入shape: [1,3,%d,%d]",
+             input_size_, input_size_);
 }
 
 // 设置敌方颜色 → 转为 class 行号
@@ -62,8 +67,8 @@ std::vector<cv::Point2f> YoloBuffDetector::remapKeypoints(const std::vector<cv::
 // 返回 factor=1/scale, 用于将模型输出坐标还原到原图
 float YoloBuffDetector::fillTensor(cv::Mat& input_image) {
     const size_t channels = 3;
-    const size_t height   = 640;
-    const size_t width    = 640;
+    const size_t height   = static_cast<size_t>(input_size_);  // 原硬编码 640
+    const size_t width    = static_cast<size_t>(input_size_);  // 原硬编码 640
 
     const float scale = std::min(
         height / static_cast<float>(input_image.rows),
@@ -133,6 +138,7 @@ std::vector<BuffDetection> YoloBuffDetector::getBestBox(cv::Mat& image) {
             best_idx  = i;
         }
     }
+    last_best_conf_ = best_conf;   // 丢检诊断: 记录过滤前的最高分
 
     // Step 4: 置信度过滤
     std::vector<BuffDetection> results;
@@ -204,8 +210,10 @@ std::vector<BuffDetection> YoloBuffDetector::getMultiBoxes(cv::Mat& image) {
     std::vector<float>       confidences;
     std::vector<std::vector<cv::Point2f>> all_kpts;
 
+    float max_score = 0.0f;
     for (int i = 0; i < det_output.cols; ++i) {
         float score = det_output.at<float>(class_row, i);
+        if (score > max_score) max_score = score;   // 记在阈值过滤之前, 供丢检诊断
         if (score > conf_threshold_) {
             float cx = det_output.at<float>(0, i);
             float cy = det_output.at<float>(1, i);
@@ -243,9 +251,11 @@ std::vector<BuffDetection> YoloBuffDetector::getMultiBoxes(cv::Mat& image) {
         cv::rectangle(image, det.rect, cv::Scalar(255, 255, 255), 1);
     }
 
+    last_best_conf_ = max_score;   // 丢检诊断: 过滤前的最高分
+
     float t = (cv::getTickCount() - start) / cv::getTickFrequency();
-    ROS_DEBUG("[BuffRecognizer] 多框推理: %zu个候选, 耗时%.1fms",
-              results.size(), t * 1000);
+    ROS_DEBUG("[BuffRecognizer] 多框推理: %zu个候选, max_conf=%.3f, 耗时%.1fms",
+              results.size(), max_score, t * 1000);
     return results;
 }
 
@@ -254,12 +264,33 @@ std::vector<BuffDetection> YoloBuffDetector::getMultiBoxes(cv::Mat& image) {
 // ============================================================================
 
 BuffRecognizer::BuffRecognizer(const std::string& model_path,
-                               const std::string& enemy_color)
-    : detector_(model_path, 0.2f, 0.2f, (enemy_color == "blue" ? 0 : 1))
+                               const std::string& enemy_color,
+                               const std::string& model_device)
+    : detector_(model_path, 0.2f, 0.2f, (enemy_color == "blue" ? 0 : 1), model_device)
     //            模型路径    置信度 NMS    enemy_class: blue→0(red行), red→1(blue行)
 {
     ROS_INFO("[BuffRecognizer] 初始化完成, model=%s, enemy=%s",
              model_path.c_str(), enemy_color.c_str());
+}
+
+// 识别参数注入 (由 Fu.cpp 从 Buff.recognition / Buff.model 载入, 默认值=迁移前硬编码)
+void BuffRecognizer::configure(const buff::RecognitionConfig& config,
+                               const buff::ModelConfig& model) {
+    recog_ = config;
+    detector_.configure(static_cast<float>(config.conf_threshold),
+                        static_cast<float>(config.nms_threshold),
+                        model.input_size);
+    stabilizer_.configure(static_cast<float>(config.stabilizer_alpha),
+                          static_cast<float>(config.assoc_gate_min_px),
+                          static_cast<float>(config.assoc_gate_radius_ratio),
+                          config.jump_confirm_frames,
+                          config.reacquire_confirm_frames);
+    binary_threshold_ = config.binary_threshold;
+    dilate_kernel_size_ = config.dilate_kernel_size;
+    r_center_mask_ratio_ = config.r_center_mask_ratio;
+    r_center_contour_div_ = config.r_center_contour_div;
+    r_center_refine_max_shift_ = config.r_center_refine_max_shift;
+    box_alpha_ = static_cast<float>(config.box_alpha);
 }
 
 // ====== 图像预处理: 灰度→二值化→膨胀 ======
@@ -350,7 +381,7 @@ int BuffRecognizer::selectTemporalDetection(
 
     float association_gate_px = 0.0f;
     if (has_prev_) {
-        association_gate_px = BuffDetectionStabilizer::associationGateForRadius(
+        association_gate_px = stabilizer_.associationGateForRadius(
             static_cast<float>(last_track_radius_));
     }
 
@@ -374,7 +405,8 @@ int BuffRecognizer::selectTemporalDetection(
         // Only compensate when deltas are physically plausible.
         // A single-frame gimbal change >15° (~450 px at fx≈1725) is a sensor glitch,
         // not real motion — skip compensation rather than corrupting the gate.
-        if (std::abs(dpitch) < 0.262f && std::abs(dyaw) < 0.262f) {  // 15° in radians
+        if (std::abs(dpitch) < recog_.ego_motion_max_delta_rad &&   // 原 0.262f (15°)
+            std::abs(dyaw) < recog_.ego_motion_max_delta_rad) {
             // Small-angle approximation for gimbal rotation:
             //   yaw positive (camera turns right) → image content shifts left  → Δu ≈ -fx·Δyaw
             //   pitch positive (camera tilts up)  → image content shifts down → Δv ≈ +fy·Δpitch
@@ -485,8 +517,30 @@ bool BuffRecognizer::identify(const cv::Mat& frame,
     int64 t_yolo_end = cv::getTickCount();
     if (results.empty()) {
         consecutive_fail_++;
-        resetTemporalState();
-        ROS_DEBUG("[BuffRecognizer] 未检测到目标 (连续失败:%d)", consecutive_fail_);
+        // 丢帧滞回: 单帧 miss 不清时序状态, 连续 miss_reset_frames 帧才重置。
+        // 清掉 has_prev_ 会让下一帧检出强制走 3 帧重捕获确认; 保留它则可以直接
+        // 按原关联门限接上, 把单帧丢检的代价从 3 帧降到 1 帧。
+        if (consecutive_fail_ >= recog_.miss_reset_frames) {
+            resetTemporalState();
+        }
+        // 原实现只打 ROS_DEBUG, 丢失期间终端一片安静; 改为 WARN 并带上过滤前的
+        // 最高置信度, 用来区分"框就在阈值边上"(降阈值即可) 和"模型真认不出"(补数据)
+        ROS_WARN_THROTTLE(0.5,
+            "[BuffRecognizer] YOLO 无候选 (连续失败:%d, max_conf=%.3f, thr=%.2f)",
+            consecutive_fail_, detector_.lastBestConf(), recog_.conf_threshold);
+        // 存图: 丢检首帧 + 之后每 10 帧存一张, 文件名带上过滤前的最高置信度。
+        // 这批帧正是模型当前学不会的样本 (max_conf=0.000~0.113), 拿去标注补数据。
+        // 目录不存在时 cv::imwrite 会静默返回 false, 需要先 mkdir -p。
+        if (consecutive_fail_ == 1 || consecutive_fail_ % 10 == 0) {
+            static const char* kMissDumpDir = "/home/rm/buff_miss";
+            static int dump_seq = 0;
+            char dump_name[192];
+            std::snprintf(dump_name, sizeof(dump_name),
+                          "%s/%06d_c%.3f_n%02d.jpg", kMissDumpDir, dump_seq++,
+                          detector_.lastBestConf(),
+                          consecutive_fail_ > 99 ? 99 : consecutive_fail_);
+            cv::imwrite(dump_name, frame);
+        }
         return false;
     }
     consecutive_fail_ = 0;
@@ -497,7 +551,9 @@ bool BuffRecognizer::identify(const cv::Mat& frame,
         // Enter reacquisition instead of silently picking a distant
         // high-confidence candidate (see Section 4.3 of the bug-fix document).
         consecutive_fail_++;
-        resetTemporalState();
+        if (consecutive_fail_ >= recog_.miss_reset_frames) {
+            resetTemporalState();
+        }
         ROS_WARN_THROTTLE(0.5,
             "[BuffRecognizer] 时序关联失败: 无候选在关联门限内 (candidates=%zu)", results.size());
         return false;
@@ -528,7 +584,7 @@ bool BuffRecognizer::identify(const cv::Mat& frame,
         {raw_r_center.x, raw_r_center.y}, {raw_fan_center.x, raw_fan_center.y}, selected.prob};
 
     if (!stabilizer_.confirmReacquisition(
-            measurement, BuffDetectionStabilizer::associationGateForRadius(
+            measurement, stabilizer_.associationGateForRadius(
                              static_cast<float>(radius)))) {
         ROS_DEBUG("[BuffRecognizer] 重捕获待确认");
         return false;
@@ -538,9 +594,10 @@ bool BuffRecognizer::identify(const cv::Mat& frame,
     if (has_prev_) {
         float dist_fan = cv::norm(raw_fan_center - last_Fan_center_);
         float dist_r   = cv::norm(raw_r_center   - last_R_center_);
-        if (dist_fan > radius * 0.55f || dist_r > radius * 0.35f) {
+        if (dist_fan > radius * recog_.jump_fan_radius_ratio ||   // 原 0.55f
+            dist_r   > radius * recog_.jump_r_radius_ratio) {     // 原 0.35f
             const float association_gate_px =
-                BuffDetectionStabilizer::associationGateForRadius(
+                stabilizer_.associationGateForRadius(
                     static_cast<float>(std::max(radius, last_track_radius_)));
             const bool confirmed_jump = stabilizer_.confirmPersistentJump(
                 measurement, association_gate_px);
@@ -560,14 +617,15 @@ bool BuffRecognizer::identify(const cv::Mat& frame,
             // from the previously tracked target.
             const double new_radius = cv::norm(raw_fan_center - raw_r_center);
             const double radius_change_ratio =
-                last_track_radius_ > 1.0
+                last_track_radius_ > recog_.min_valid_radius_px      // 原 > 1.0
                     ? std::abs(new_radius - last_track_radius_) / last_track_radius_
                     : 0.0;
             const double side_change_ratio =
-                last_side_ > 1.0
+                last_side_ > recog_.min_valid_radius_px              // 原 > 1.0
                     ? std::abs(out_side - last_side_) / last_side_
                     : 0.0;
-            if (radius_change_ratio > 0.50 || side_change_ratio > 0.50) {
+            if (radius_change_ratio > recog_.radius_change_reject_ratio ||  // 原 0.50
+                side_change_ratio > recog_.side_change_reject_ratio) {      // 原 0.50
                 // The geometrically-confirmed jump candidate is too different
                 // from the previous target — more likely a different blade or a
                 // false positive than the same target after ego-motion.

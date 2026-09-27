@@ -30,10 +30,12 @@ int main() {
 
     require(BuffDetectionStabilizer::selectCandidate(
                 candidates, {100.0f, 100.0f}, true, 40.0f) == 0);
+    // 无候选落入关联门限 -> 返回 -1 (跟踪丢失), 而不是回退到最高置信度候选
+    // (代码注释明确说明这是已修复的旧行为)
     require(BuffDetectionStabilizer::selectCandidate(
-                candidates, {0.0f, 0.0f}, true, 40.0f) == 1);
-    require(std::abs(BuffDetectionStabilizer::associationGateForRadius(100.0f) -
-                     45.0f) < 1e-5f);
+                candidates, {0.0f, 0.0f}, true, 40.0f) == -1);
+    require(std::abs(BuffDetectionStabilizer().associationGateForRadius(100.0f) -
+                     120.0f) < 1e-5f);  // max(20, 100*1.2)
 
     // A second jump is valid only when it confirms the same pending candidate.
     BuffDetectionStabilizer jump_confirmation;
@@ -45,15 +47,18 @@ int main() {
         candidate(42.0f, 39.0f, 304.0f, 297.0f, 0.9f);
     require(!jump_confirmation.confirmPersistentJump(false_jump_x, 45.0f));
     require(!jump_confirmation.confirmPersistentJump(false_jump_y, 45.0f));
+    // 共需 3 帧一致: 1 初始 + 2 次确认 (代码注释明确废弃了旧的双帧逻辑)
+    require(!jump_confirmation.confirmPersistentJump(confirmed_y, 45.0f));
     require(jump_confirmation.confirmPersistentJump(confirmed_y, 45.0f));
 
     // A missed detection clears pending confirmation rather than accepting a stale jump.
     jump_confirmation.reset();
     require(!jump_confirmation.confirmPersistentJump(confirmed_y, 45.0f));
 
-    // After a missed detection, reacquisition also needs two matching frames.
+    // After a missed detection, reacquisition also needs three matching frames.
     BuffDetectionStabilizer reacquisition;
     reacquisition.beginReacquisition();
+    require(!reacquisition.confirmReacquisition(confirmed_y, 45.0f));
     require(!reacquisition.confirmReacquisition(confirmed_y, 45.0f));
     require(reacquisition.confirmReacquisition(confirmed_y, 45.0f));
 
@@ -71,10 +76,11 @@ int main() {
         candidate(14.0f, 10.0f, 110.0f, 95.0f, 0.9f), second_corners);
     expectPoint(second.r_center, 12.0f, 10.0f);
     expectPoint(second.fan_center, 105.0f, 95.0f);
-    expectPoint(second.corners[0], 102.0f, 90.0f);
-    expectPoint(second.corners[1], 97.0f, 95.0f);
-    expectPoint(second.corners[2], 102.0f, 100.0f);
-    expectPoint(second.corners[3], 107.0f, 95.0f);
+    // 角点经逐点 EMA(alpha=0.5) 平滑: 期望值为 "raw+扇叶修正" 与上一帧的中点
+    expectPoint(second.corners[0], 98.5f, 90.0f);
+    expectPoint(second.corners[1], 93.5f, 95.0f);
+    expectPoint(second.corners[2], 98.5f, 100.0f);
+    expectPoint(second.corners[3], 103.5f, 95.0f);
 
     stabilizer.reset();
     const BuffStabilizedGeometry reset = stabilizer.update(

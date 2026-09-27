@@ -1,14 +1,57 @@
 #pragma once
 
+#include <cmath>
+#include <limits>
+#include <string>
+
 #include "buff_prediction_geometry.hpp"
+#include "buff_config.hpp"
 
 // Buff PnP, coordinate conversion, trajectory, and world-observation code extracted from Fu.cpp without logic changes.
 
 // 前置声明: 坐标变换器(全局, main中初始化)
 extern CoordinateTransformer* g_coorConverter;
 
+// 能量机关全部参数 (Fu.cpp 中定义, main 从 rm_fu.yaml 加载)
+extern buff::BuffConfig g_buff_config;
+
 // Persistent rotation direction: +1=CW, -1=CCW, 0=unknown
 extern int g_buff_rotation_sign;
+
+// 最近一次下发的云台相对角(车体系, 弧度): x=pitch(上正) y=yaw(左正)
+extern cv::Point2f euler_angles;
+// 世界观测链是否叠加云台实时位姿(Fu.cpp 从 buff_world_apply_gimbal_pose 载入)
+extern bool g_buff_world_apply_gimbal_pose;
+
+// ── 云台位姿估计 ──
+// RmSerialData.Yaw/Pitch 是车体世界姿态(与串口四元数一致), 并不包含云台相对角;
+// 指令协议为绝对角: Angle = 车体姿态 + euler, 因此云台相对车体的位姿恰为最近
+// 下发的 euler_angles。相机装在云台上, 相机系→车体系必须叠加该旋转, 否则观测
+// 会随云台摆动出现米级假运动(BUFF_SYNC 里 direct 位置随 yaw/pitch 摆 5m 即此因)。
+// 用 EMA 平滑逼近云台实际姿态, 吸收 MCU 跟踪滞后与逐帧指令抖动。
+inline Eigen::Matrix3d buffGimbalToChassisRotation() {
+    static Eigen::Vector2d smoothed(0.0, 0.0);
+    static bool initialized = false;
+    if (!g_buff_world_apply_gimbal_pose) {
+        return Eigen::Matrix3d::Identity();
+    }
+    const Eigen::Vector2d command(euler_angles.x, euler_angles.y);
+    if (!initialized) {
+        smoothed = command;
+        initialized = true;
+    } else {
+        // 原硬编码 0.30 → Buff.control.gimbal_pose_alpha
+        const double alpha = g_buff_config.control.gimbal_pose_alpha;
+        smoothed = (1.0 - alpha) * smoothed + alpha * command;
+    }
+    const double cy = std::cos(smoothed.y()), sy = std::sin(smoothed.y());
+    const double cp = std::cos(smoothed.x()), sp = std::sin(smoothed.x());
+    Eigen::Matrix3d rotation;
+    rotation << cy * cp, -sy, cy * sp,
+                sy * cp,  cy, sy * sp,
+                -sp,      0.0, cp;
+    return rotation;
+}
 
 //重力补偿器
 class PnPSolver_gravity
@@ -94,12 +137,18 @@ PnPSolver_gravity(double target_width_mm, double target_height_mm,
 
 }
 
+// 弹道/相位参数注入 (由 Fu.cpp 从 Buff.ballistic 载入)
+void configure(const buff::BallisticConfig& config) {
+    ballistic_ = config;
+}
+
 // Input points are the four Buff edge centers in recognizer order.
 // Output tvec is the target center in OpenCV camera coordinates (mm).
 bool solvePnP(const cv::Point2f & top, const cv::Point2f & left,
               const cv::Point2f & bottom, const cv::Point2f & right,
               cv::Mat & rvec, cv::Mat & tvec)
 {
+  last_reprojection_error_ = std::numeric_limits<double>::quiet_NaN();
   const std::vector<cv::Point2f> image_blade_points{top, left, bottom, right};
 
   // IPPE gives a stable initial pose for a planar target. ITERATIVE then refines
@@ -140,6 +189,34 @@ bool solvePnP(const cv::Point2f & top, const cv::Point2f & left,
 //   }
 
   return tvec.at<double>(2, 0) > 0.0;
+}
+
+double lastReprojectionError() const {
+  return last_reprojection_error_;
+}
+
+void beginPredictionFrame() {
+  resetPredictionDiagnostics();
+}
+
+const std::string& lastPredictionFailureReason() const {
+  return last_prediction_failure_reason_;
+}
+
+const Eigen::Vector3d& lastPredictedTargetGun() const {
+  return last_predicted_target_gun_;
+}
+
+double lastGunPitchRawDeg() const {
+  return last_gun_pitch_raw_deg_;
+}
+
+double lastGunYawDeg() const {
+  return last_gun_yaw_deg_;
+}
+
+double lastCompensatedPitchDeg() const {
+  return last_compensated_pitch_deg_;
 }
 
 // Use the recognizer's unshifted points for coordinate-convention debugging.
@@ -222,13 +299,19 @@ bool buildWorldObservation(const cv::Point2f& top, const cv::Point2f& left,
     const Eigen::Matrix3d imu_to_map_rotation = g_quaternion_is_imu_to_map
         ? quaternion_rotation : quaternion_rotation.transpose();
     const Eigen::Vector3d map_translation = g_coorConverter->imu2Map_trans_mat;
+    // 相机→云台(静态安装)→车体: 缺云台位姿时观测随云台摆动出现米级假运动,
+    // 是世界 EKF center 状态发散的根因之一。
+    const Eigen::Matrix3d gimbal_to_chassis = buffGimbalToChassisRotation();
 
     observation.stamp_seconds = g_frame_image_stamp.toSec();
     observation.target_center_map = imu_to_map_rotation *
-        g_coorConverter->cam2Imu(target_center_cam) + map_translation;
+        (gimbal_to_chassis *
+            g_coorConverter->cam2Imu(target_center_cam)) + map_translation;
     observation.r_center_map = imu_to_map_rotation *
-        g_coorConverter->cam2Imu(r_center_cam) + map_translation;
+        (gimbal_to_chassis *
+            g_coorConverter->cam2Imu(r_center_cam)) + map_translation;
     observation.target_normal_map = (imu_to_map_rotation *
+        gimbal_to_chassis *
         g_coorConverter->cam2Imu_rot_mat * normal_cam).normalized();
     return observation.target_center_map.allFinite() &&
         observation.r_center_map.allFinite() &&
@@ -247,7 +330,9 @@ float calculateDistanceToCenter(const cv::Point2f & image_point)
 //计算空间角
 cv::Point2f calculate_space_angle(const cv::Point2f & center)
 {
-    static cv::Point2f cameraCenter = cv::Point2f(camera_matrix_.at<double>(0, 2)-23,camera_matrix_.at<double>(1, 2)+24); 
+    static cv::Point2f cameraCenter = cv::Point2f(
+        camera_matrix_.at<double>(0, 2) + ballistic_.optical_center_offset_x,   // 原 -23
+        camera_matrix_.at<double>(1, 2) + ballistic_.optical_center_offset_y);  // 原 +24
     //static cv::Point2f cameraCenter = cv::Point2f(camera_matrix_.at<double>(0, 2),camera_matrix_.at<double>(1, 2)); 
     // return cv::Point2f(center.y, center.x);
 	double pitch, yaw;
@@ -285,17 +370,20 @@ cv::Point2f calculate_space_angle(const cv::Point2f & center)
 double time_parameter = 0;//将时间定义在类内函数外用于类外提取飞行时间
 double calculateTrajectory_gun(const Eigen::Vector3d& tvec_gun) {
     time_parameter = 0;
-    const int iteration_times = 30; // 迭代上限次数
-    float velocity = 24; // 打弹速度
-    if(RmSerialData.BulletVec > 10){
+    // 原硬编码: iteration_times=30 / velocity=24 / velocity门限>10 / gravity=9.8
+    const int iteration_times = ballistic_.iteration_times;
+    const double angle_limit_rad = ballistic_.angle_limit_deg * M_PI / 180.0;
+    float velocity = static_cast<float>(ballistic_.default_velocity);
+    if(RmSerialData.BulletVec > ballistic_.velocity_min_valid){
         velocity = RmSerialData.BulletVec;
     }
-    const float gravity = 9.8f; // 重力加速度
+    const float gravity = static_cast<float>(ballistic_.gravity);
 
     // 枪管系: 水平距离和高度直接用向量分量
     double distance_xy = sqrt(tvec_gun.x()*tvec_gun.x() + tvec_gun.y()*tvec_gun.y());
     double target_z = tvec_gun.z();
     if (distance_xy < 1e-6) {
+        last_prediction_failure_reason_ = "trajectory_zero_distance";
         return -50;
     }
 
@@ -306,9 +394,10 @@ double calculateTrajectory_gun(const Eigen::Vector3d& tvec_gun) {
     for (int i = 0; i < iteration_times; ++i) {
         pitch_angle = std::atan2(iterative_height, distance_xy);
 
-        if (std::abs(pitch_angle) > M_PI*0.165) {
+        if (std::abs(pitch_angle) > angle_limit_rad) {
             std::cerr << "异常:补偿角度超过30度!" << std::endl;
             cout<<"pitch_angle"<<pitch_angle<<endl;
+            last_prediction_failure_reason_ = "trajectory_angle_limit";
             return -50;
         }
 
@@ -319,41 +408,55 @@ double calculateTrajectory_gun(const Eigen::Vector3d& tvec_gun) {
         if (time_parameter < 0) {
             std::cerr << "异常:飞行时间负数!" << std::endl;
             time_parameter = 0;
+            last_prediction_failure_reason_ = "trajectory_negative_time";
             return -50;
         }
 
         impact_point_height = velocity*std::sin(pitch_angle)*time_parameter-0.5*gravity*time_parameter*time_parameter;
         height_difference = target_z - impact_point_height;
 
-        if (std::abs(height_difference) < 0.0001) break;
+        if (std::abs(height_difference) < ballistic_.converge_epsilon) break;  // 原 0.0001
         iterative_height += height_difference;
     }
 
-    if (std::abs(height_difference) > 0.01 || std::abs(pitch_angle) > M_PI*0.165) {
+    if (std::abs(height_difference) > ballistic_.height_tolerance ||           // 原 0.01
+        std::abs(pitch_angle) > angle_limit_rad) {
         std::cerr << "异常:高度差过大或角度超出限制!" << std::endl;
+        last_prediction_failure_reason_ = "trajectory_not_converged";
         return -50;
     }
 
+    last_compensated_pitch_deg_ = pitch_angle * 180.0 / PI;
     return pitch_angle; // 枪管系补偿后pitch
 }
 
 cv::Point2f solveGunPointAndGravity(const Eigen::Vector3d& target_gun) {
     cv::Point2f space_angle = {0, 0};
+    last_predicted_target_gun_ = target_gun;
+    last_gun_pitch_raw_deg_ = std::numeric_limits<double>::quiet_NaN();
+    last_gun_yaw_deg_ = std::numeric_limits<double>::quiet_NaN();
+    last_compensated_pitch_deg_ = std::numeric_limits<double>::quiet_NaN();
+    if (!target_gun.allFinite()) {
+        return predictionFailure("invalid_target_gun");
+    }
     const double gun_yaw = std::atan2(target_gun.y(), target_gun.x());
     const double gun_pitch_raw = std::atan2(
         target_gun.z(), std::hypot(target_gun.x(), target_gun.y()));
-    if (std::abs(gun_pitch_raw) > PI * 0.165 ||
-        std::abs(gun_yaw) > PI * 0.165) {
-        ROS_WARN_THROTTLE(
-            1.0, "[Fu] Reject Buff gun point: pitch=%.2f deg yaw=%.2f deg",
-            gun_pitch_raw * 180.0 / PI, gun_yaw * 180.0 / PI);
-        return space_angle;
+    last_gun_pitch_raw_deg_ = gun_pitch_raw * 180.0 / PI;
+    last_gun_yaw_deg_ = gun_yaw * 180.0 / PI;
+    const double angle_limit_rad = ballistic_.angle_limit_deg * PI / 180.0;  // 原 PI*0.165
+    if (std::abs(gun_pitch_raw) > angle_limit_rad ||
+        std::abs(gun_yaw) > angle_limit_rad) {
+        return predictionFailure("gun_angle_limit");
     }
 
     const double compensated_pitch = calculateTrajectory_gun(target_gun);
-    if (compensated_pitch == -50) return space_angle;
+    if (compensated_pitch == -50) {
+        return predictionFailure(last_prediction_failure_reason_);
+    }
     space_angle.x = compensated_pitch;
     space_angle.y = gun_yaw;
+    last_prediction_failure_reason_ = "ok";
     return space_angle;
 }
 
@@ -385,10 +488,11 @@ cv::Point2f PnPSolver_predicted_center_and_gravity(
     const cv::Point2f& predicted_fan_pixel, const double& /*car_pitch*/) {
     cv::Mat rvec;
     cv::Mat tvec;
+    resetPredictionDiagnostics();
     if (g_coorConverter == nullptr ||
         !solvePnP(top, left, bottom, right, rvec, tvec)) {
-        // fprintf(stderr, "[DBG] pred_cg: solvePnP failed or null converter\n");
-        return cv::Point2f(0, 0);
+        return predictionFailure(g_coorConverter == nullptr
+            ? "coordinate_transformer_null" : "prediction_pnp_failed");
     }
     // fprintf(stderr, "[DBG] pred_cg: solvePnP ok rvec.t=%d size=%dx%d\n", rvec.type(), rvec.rows, rvec.cols);
 
@@ -399,14 +503,31 @@ cv::Point2f PnPSolver_predicted_center_and_gravity(
     if (!std::isfinite(observed_radius_squared) ||
         !std::isfinite(predicted_radius_squared) ||
         observed_radius_squared < 1.0 || predicted_radius_squared < 1.0) {
-        return cv::Point2f(0, 0);
+        return predictionFailure("invalid_prediction_radius");
+    }
+    // 预测点必须落在同一个圆上 (0.6R ~ 1.5R)。相位跟踪器的 center_ 一旦和观测到的
+    // r_center 分离, predicted_center 会跑出圆外, 长度比的平方就会明显偏离 1。
+    // 在这里拦掉比让下游 physical_phase_limit 拦更好定位 —— 后者只说明"角度离谱",
+    // 前者直接指出"预测点不在圆上"。
+    {
+        constexpr double kRatioMinSquared = 0.36;   // (0.6)^2
+        constexpr double kRatioMaxSquared = 2.25;   // (1.5)^2
+        const double radius_ratio_squared =
+            predicted_radius_squared / observed_radius_squared;
+        if (radius_ratio_squared < kRatioMinSquared ||
+            radius_ratio_squared > kRatioMaxSquared) {
+            return predictionFailure("predicted_radius_mismatch");
+        }
     }
 
     const double image_phase_delta = std::atan2(
         observed_radius.x * predicted_radius.y -
             observed_radius.y * predicted_radius.x,
         observed_radius.dot(predicted_radius));
-    if (!std::isfinite(image_phase_delta)) return cv::Point2f(0, 0);
+    if (!std::isfinite(image_phase_delta)) {
+        return predictionFailure("image_phase_invalid");
+    }
+    last_image_phase_delta_deg_ = image_phase_delta * 180.0 / PI;
 
     cv::Mat rotation_cv;
     cv::Rodrigues(rvec, rotation_cv);
@@ -441,18 +562,16 @@ cv::Point2f PnPSolver_predicted_center_and_gravity(
     BuffPredictionGeometry::Vec3 fan_center_cam;
     if (!pixel_to_plane(r_center_pixel, r_center_cam) ||
         !pixel_to_plane(fan_center_pixel, fan_center_cam)) {
-        // fprintf(stderr, "[DBG] pred_cg: pixel_to_plane failed\n");
-        return cv::Point2f(0, 0);
+        return predictionFailure("pixel_to_plane_failed");
     }
     // fprintf(stderr, "[DBG] pred_cg: pixel_to_plane ok\n");
 
-    constexpr double kPhaseSignProbeRadians = 0.30;
+    const double kPhaseSignProbeRadians = ballistic_.phase_probe_rad;  // 原 0.30
     BuffPredictionGeometry::Vec3 positive_offset;
     if (!BuffPredictionGeometry::rotateAroundAxis(
             fan_center_cam - r_center_cam, plane_normal,
             kPhaseSignProbeRadians, positive_offset)) {
-        // fprintf(stderr, "[DBG] pred_cg: rotateAroundAxis failed\n");
-        return cv::Point2f(0, 0);
+        return predictionFailure("phase_probe_rotation_failed");
     }
     // fprintf(stderr, "[DBG] pred_cg: rotateAroundAxis ok\n");
 
@@ -466,7 +585,9 @@ cv::Point2f PnPSolver_predicted_center_and_gravity(
         cv::Mat::zeros(3, 1, CV_64F), cv::Mat::zeros(3, 1, CV_64F),
         camera_matrix_, dist_coeffs_, positive_probe_pixel);
     // fprintf(stderr, "[DBG] pred_cg: projectPoints ok sz=%zu\n", positive_probe_pixel.size());
-    if (positive_probe_pixel.size() != 1) return cv::Point2f(0, 0);
+    if (positive_probe_pixel.size() != 1) {
+        return predictionFailure("phase_probe_projection_failed");
+    }
 
     const cv::Point2d positive_probe_radius =
         positive_probe_pixel[0] - cv::Point2d(r_center_pixel);
@@ -474,45 +595,54 @@ cv::Point2f PnPSolver_predicted_center_and_gravity(
         observed_radius.x * positive_probe_radius.y -
             observed_radius.y * positive_probe_radius.x,
         observed_radius.dot(positive_probe_radius));
+    last_positive_image_phase_deg_ = positive_image_phase * 180.0 / PI;
     double physical_phase_delta = 0.0;
     if (std::isfinite(positive_image_phase) &&
-        std::abs(positive_image_phase) >= 0.015) {
+        std::abs(positive_image_phase) >= ballistic_.probe_valid_rad) {  // 原 0.015
         // Probe signal is strong, use it directly.
         if (!BuffPredictionGeometry::physicalPhaseForImagePhase(
                 image_phase_delta, positive_image_phase,
                 physical_phase_delta)) {
-            return cv::Point2f(0, 0);
+            return predictionFailure("physical_phase_invalid");
         }
     } else if (g_buff_rotation_sign != 0) {
         // Probe is ambiguous (e.g. edge-on view), fall back to the
         // persistent rotation direction from Kalman / fallback paths.
-        if (!std::isfinite(image_phase_delta)) return cv::Point2f(0, 0);
+        if (!std::isfinite(image_phase_delta)) {
+            return predictionFailure("image_phase_invalid");
+        }
         physical_phase_delta = g_buff_rotation_sign > 0
             ? image_phase_delta : -image_phase_delta;
     } else {
-        return cv::Point2f(0, 0);
+        return predictionFailure("rotation_direction_unknown");
     }
 
     // Sanity check: physical phase delta must be within physically
     // possible bounds. Max omega ~2.0 rad/s x delta_t ~0.5s = 1.0 rad.
     // A 2.5 rad (143 deg) limit is generous.
     if (!std::isfinite(physical_phase_delta) ||
-        std::abs(physical_phase_delta) > 2.5) {
-        return cv::Point2f(0, 0);
+        std::abs(physical_phase_delta) > ballistic_.physical_phase_limit_rad) {  // 原 2.5
+        return predictionFailure("physical_phase_limit");
     }
+    last_physical_phase_delta_deg_ = physical_phase_delta * 180.0 / PI;
     BuffPredictionGeometry::Vec3 predicted_offset;
     if (!BuffPredictionGeometry::rotateAroundAxis(
             fan_center_cam - r_center_cam, plane_normal,
             physical_phase_delta, predicted_offset)) {
-        return cv::Point2f(0, 0);
+        return predictionFailure("prediction_rotation_failed");
     }
 
     const Eigen::Vector3d predicted_center_cam(
         (r_center_cam.x + predicted_offset.x) * 0.001,
         (r_center_cam.y + predicted_offset.y) * 0.001,
         (r_center_cam.z + predicted_offset.z) * 0.001);
-    auto result = solveGunPointAndGravity(
-        g_coorConverter->cam2Gun(predicted_center_cam));
+    // 相机在云台上: 叠加云台位姿换算到车体系, 得到车体系目标方向。
+    // 指令协议为绝对角(Angle = 车体姿态 + euler), 只有车体系方向才能与
+    // 当前云台角相加; 直接对旋转后的相机系做静态外参会形成正反馈震荡。
+    last_predicted_target_gun_ = g_coorConverter->imu2Gun(
+        buffGimbalToChassisRotation() *
+        g_coorConverter->cam2Imu(predicted_center_cam));
+    auto result = solveGunPointAndGravity(last_predicted_target_gun_);
     // fprintf(stderr, "[DBG] pred_cg: solveGunPointAndGravity ok result=(%.4f,%.4f)\n", result.x, result.y);
     return result;
 }
@@ -541,13 +671,16 @@ cv::Point2f PnPSolver_and_gravity(const cv::Point2f & top, const cv::Point2f & l
         tvec.at<double>(1, 0) * 0.001,  // OpenCV y(下)
         tvec.at<double>(2, 0) * 0.001   // OpenCV z(前)
     );
-    Eigen::Vector3d tvec_gun = g_coorConverter->cam2Gun(tvec_cam);
+    // 相机在云台上: 先叠云台位姿到车体系, 再按静态枪管外参解算(绝对角指令协议)
+    Eigen::Vector3d tvec_gun = g_coorConverter->imu2Gun(
+        buffGimbalToChassisRotation() * g_coorConverter->cam2Imu(tvec_cam));
 
     // 枪管系 pitch/yaw: x前 y左 z上
     double gun_yaw   = atan2(tvec_gun.y(), tvec_gun.x());
     double gun_pitch_raw = atan2(tvec_gun.z(), sqrt(tvec_gun.x()*tvec_gun.x() + tvec_gun.y()*tvec_gun.y()));
 
-    if (abs(gun_pitch_raw) > PI*0.165 || abs(gun_yaw) > PI*0.165){//异常检测
+    const double angle_limit_rad = ballistic_.angle_limit_deg * PI / 180.0;  // 原 PI*0.165
+    if (abs(gun_pitch_raw) > angle_limit_rad || abs(gun_yaw) > angle_limit_rad){//异常检测
         cout << "异常:枪管系角度超限!" << endl;
         cout << "pitch:" << gun_pitch_raw*180/PI << " yaw:" << gun_yaw*180/PI << endl;
         cout << "tvec_cam(mm):" << tvec_cam.transpose()*1000 << endl;
@@ -582,8 +715,40 @@ else{
 
 
 private:
+    void resetPredictionDiagnostics() {
+        last_prediction_failure_reason_ = "not_run";
+        last_predicted_target_gun_ = Eigen::Vector3d::Zero();
+        last_gun_pitch_raw_deg_ = std::numeric_limits<double>::quiet_NaN();
+        last_gun_yaw_deg_ = std::numeric_limits<double>::quiet_NaN();
+        last_compensated_pitch_deg_ = std::numeric_limits<double>::quiet_NaN();
+        last_image_phase_delta_deg_ = std::numeric_limits<double>::quiet_NaN();
+        last_positive_image_phase_deg_ = std::numeric_limits<double>::quiet_NaN();
+        last_physical_phase_delta_deg_ = std::numeric_limits<double>::quiet_NaN();
+    }
+
+    cv::Point2f predictionFailure(const std::string& reason) {
+        last_prediction_failure_reason_ = reason;
+        ROS_WARN_THROTTLE(
+            0.5,
+            "[BUFF_PRED_FAIL] reason=%s image_phase_deg=%.2f "
+            "positive_phase_deg=%.2f physical_phase_deg=%.2f "
+            "target_gun=(%.3f,%.3f,%.3f) gun_pitch_raw_deg=%.2f "
+            "gun_yaw_deg=%.2f compensated_pitch_deg=%.2f",
+            last_prediction_failure_reason_.c_str(),
+            last_image_phase_delta_deg_, last_positive_image_phase_deg_,
+            last_physical_phase_delta_deg_,
+            last_predicted_target_gun_.x(), last_predicted_target_gun_.y(),
+            last_predicted_target_gun_.z(), last_gun_pitch_raw_deg_,
+            last_gun_yaw_deg_, last_compensated_pitch_deg_);
+        return cv::Point2f(0, 0);
+    }
+
     cv::Mat camera_matrix_;
     cv::Mat dist_coeffs_;
+
+    // 弹道/相位参数 (由 Fu.cpp 从 rm_fu.yaml 的 Buff.ballistic 载入)。
+    // 默认值 == 迁移前的硬编码值, 因此未调用 configure() 时行为完全不变。
+    buff::BallisticConfig ballistic_;
 
   /*1704.45313471055	0.460601854648428	665.913826347723
     0	1704.60254015387	487.291315275975
@@ -603,6 +768,14 @@ private:
   // Four Buff edge centers in [top, left, bottom, right] order.
   std::vector<cv::Point3f> blade_points_;
   double last_reprojection_error_ = 0.0;
+  std::string last_prediction_failure_reason_ = "not_run";
+  Eigen::Vector3d last_predicted_target_gun_ = Eigen::Vector3d::Zero();
+  double last_gun_pitch_raw_deg_ = std::numeric_limits<double>::quiet_NaN();
+  double last_gun_yaw_deg_ = std::numeric_limits<double>::quiet_NaN();
+  double last_compensated_pitch_deg_ = std::numeric_limits<double>::quiet_NaN();
+  double last_image_phase_delta_deg_ = std::numeric_limits<double>::quiet_NaN();
+  double last_positive_image_phase_deg_ = std::numeric_limits<double>::quiet_NaN();
+  double last_physical_phase_delta_deg_ = std::numeric_limits<double>::quiet_NaN();
 };
 
 

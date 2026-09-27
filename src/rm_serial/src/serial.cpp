@@ -1,51 +1,100 @@
+// 哨兵能量机关串口节点
+// 上行: 解析电控49字节帧 -> 发布 /RmSerialData(视觉用姿态) /SentrySerial(哨兵状态) imu/data_raw
+// 下行: 持续发送16字节帧(线速度/角速度/云台pitch/yaw角/各标志位)给电控
+// 打符模式写死: 电控侧没有按f切换逻辑, ShootFlag 恒定 'f', 收到 /auto_angle 直接发 pitch/yaw
+
 #include <ros/ros.h>
 #include "Serial.h"
+#include <std_msgs/Int32.h>
 #include "rm_msgs/RmSerial.h"
+#include "rm_msgs/SentrySerial.h"
 #include "sensor_msgs/Imu.h"
 #include "geometry_msgs/Vector3.h"
 #include "tf2/LinearMath/Quaternion.h"
-#include <thread>
+#include "geometry_msgs/TwistStamped.h"
 #include <string>
 #include <chrono>
+#include <thread>
 #include <fstream>
 #include <yaml-cpp/yaml.h>
-using namespace std;
 
-static std::string SPName = "/dev/ttyUSB0";
+static std::string SPName = "/dev/ttyUSB0";///dev/ttyACM0
 constexpr char* SerialPrefix = "/dev/";
 const std::string Prefix[] = {"ttyUSB","ttyACM","ttyCH343USB"};
-constexpr int Upper = 10; 
+constexpr int Upper = 10;
 constexpr int Lower = 0;
 
+using namespace std;
+float speed_x, speed_y, speed_w;
+int up_flag = 0;
+int super_speed = 1;
+int lock_head = 0;
+
 class RmSerial
-{  
-public: 
-    double roll, pitch, yaw, gyro[3],accel[3],bv;
-    char camp, shootflag;
+{
+public:
+
+    int signal = 0;
+    double roll, pitch, yaw, gyro[3], accel[3];
+    char camp;
+    char shootFlag = 'f';   //写死打符模式: 电控没有按f切换逻辑, 默认打符
     vector<int> _RmSerialData;
     geometry_msgs::Vector3 angle;
+
     std::string config_path_; //存储配置路径
     double m_rollOffset = 0;
     double m_pitchOffset = 0;
     double m_yawOffset = 0;
+    double bullet_vec = 21.0; //哨兵弹速 m/s
 
     //串口函数
     SerialPort Sp;
     //自定义消息
     rm_msgs::RmSerial PubSerialData;
+    rm_msgs::SentrySerial PubSentrySerial;
     //Imu消息
     sensor_msgs::Imu ImuData;
     //发布方
     ros::Publisher Serial_Imu;
-    ros::Publisher Serial_Rm;
+    ros::Publisher Serial_Rm;//电控发过来的数据
+    ros::Publisher Serial_Sentry;//哨兵自己的血量值和弹丸数
 
+    //-------------------------------回调：发送自瞄角度模块----------------------------------------
     void ReceiveYolov8(const geometry_msgs::Vector3ConstPtr autoAngle)
     {
         angle = *autoAngle;
-        Sp.Sendcom(angle.x * 1000, angle.y * 1000,angle.z);
-        // ROS_DEBUG("serial send is ok hahahahaha");
-        // cout << "Sub:" << angle << endl;
+        signal = (int)angle.z;
     }
+    //------------------------------------------------------------------------------------------
+
+    void up_flag_callback(const std_msgs::Int32::ConstPtr& msg)
+    {
+        up_flag = msg->data;
+    }
+
+    //------------------------------------------------------------------------------------------
+
+    void super_speed_callback(const std_msgs::Int32::ConstPtr& msg)
+    {
+        super_speed = msg->data;
+    }
+
+    //------------------------------------------------------------------------------------------
+
+    void lock_head_callback(const std_msgs::Int32::ConstPtr& msg)
+    {
+        lock_head = msg->data;
+    }
+
+    //------------------------------------------------------------------------------------------
+
+    void cmd_vel_callback(const geometry_msgs::TwistStamped::ConstPtr& msg)
+    {
+        speed_x = msg->twist.linear.x;
+        speed_y = msg->twist.linear.y;
+        speed_w = msg->twist.angular.z;
+    }
+    //------------------------------------------------------------------------------------------
 
     void setParam(const std::string &file_path) {
         try{
@@ -58,7 +107,7 @@ public:
             // 2.检查文件是否打开
             std::ifstream file_check(file_path);
             if (!file_check.is_open()) {
-                ROS_ERROR("Failed to open config file: %s. Reason: %s", 
+                ROS_ERROR("Failed to open config file: %s. Reason: %s",
                         file_path.c_str(), strerror(errno));
                 return;
             }
@@ -83,50 +132,44 @@ public:
                 m_rollOffset = mod["rollOffset"].as<double>(0);
                 m_pitchOffset = mod["pitchOffset"].as<double>(0);
                 m_yawOffset = mod["yawOffset"].as<double>(0);
-                // ROS_INFO("InstallOffset parameters loaded:");
-                // ROS_INFO("m_rollOffset:%.3f",m_rollOffset);
-                // ROS_INFO("m_pitchOffset:%.3f",m_pitchOffset);
-                // ROS_INFO("m_yawOffset:%.3f",m_yawOffset);
-                // ROS_INFO("InstallOffset parameters loaded successfully");
+                ROS_INFO("InstallOffset loaded: roll=%.3f pitch=%.3f yaw=%.3f",
+                         m_rollOffset, m_pitchOffset, m_yawOffset);
             }
             else
             {
-                ROS_WARN("No 'CoordinateTransformer' section in config file");
+                ROS_WARN("No 'InstallOffset' section in config file");
             }
         }
         catch (const YAML::Exception& e) {
             ROS_ERROR("YAML parsing error: %s", e.what());
-        } 
+        }
         catch (const std::exception& e) {
             ROS_ERROR("Error loading parameters: %s", e.what());
-        } 
+        }
         catch (...) {
             ROS_ERROR("Unknown error occurred while loading config file");
         }
     }
 
-    RmSerial(ros::NodeHandle &nh, const std::string& config_path):Sp(SPName.c_str(), 36) , config_path_(config_path)
+    RmSerial(ros::NodeHandle &nh, const std::string& config_path):Sp(SPName.c_str(), 32), config_path_(config_path)
     {
         Serial_Imu = nh.advertise<sensor_msgs::Imu>("imu/data_raw",1000);
         Serial_Rm  = nh.advertise<rm_msgs::RmSerial>("/RmSerialData",1000);
+        Serial_Sentry=nh.advertise<rm_msgs::SentrySerial>("/SentrySerial",1000);
 
         // 配置参数
         if (!config_path_.empty()) {
-            try {
-                setParam(config_path_);
-                ROS_INFO("Successfully loaded parameters from: %s", config_path_.c_str());
-            } catch (const std::exception& e) {
-                ROS_ERROR("Failed to load parameters: %s", e.what());
-            }
+            setParam(config_path_);
         } else {
             ROS_WARN("No configuration file path provided. Using default parameters.");
         }
     }
 
+
+    //-------------------------------------读取电控数据模块-------------------------------------
     //从串口读到的数据进行赋值
     void RmSerialDataInit()
     {
-
         roll     = _RmSerialData[0] / 100000.0;
         pitch    = _RmSerialData[1] / 100000.0;
         yaw      = _RmSerialData[2] / 100000.0;
@@ -136,30 +179,34 @@ public:
         accel[0] = _RmSerialData[6] / 100000.0;
         accel[1] = _RmSerialData[7] / 100000.0;
         accel[2] = _RmSerialData[8] / 100000.0;
-        // cout << "roll" << roll << endl;
-        // cout << "pitch" << pitch << endl;
-        // cout << "yaw" << yaw << endl;
-        // cout << "gyro[0]" << gyro[0] << endl;
-        // cout << "gyro[1]" << gyro[1] << endl;
-        // cout << "gyro[2]" << gyro[2] << endl;
-        // cout << "accel[0]" << accel[0] << endl;
-        // cout << "accel[1]" << accel[1] << endl;
-        // cout << "accel[2]" << accel[2] << endl;
 
-        if(_RmSerialData[9])
-            camp = 'b';
+        //哨兵状态位
+        PubSentrySerial.OurSentryHp=_RmSerialData[11];                 //哨兵血量
+        PubSentrySerial.OurBaseHp=_RmSerialData[12];                   //基地血量
+        if(_RmSerialData[13]==0)                                        //补给点是否被占用
+           PubSentrySerial.Supply_Occupyed=false;
         else
+            PubSentrySerial.Supply_Occupyed=true;
+
+        PubSentrySerial.EnemyOutPostHp=_RmSerialData[14];              //敌方前哨站血量
+        PubSentrySerial.HolderFlag=_RmSerialData[15];                  //云台手是否发布点位
+        PubSentrySerial.holder_point_x=_RmSerialData[16]/100.0;        //云台手X坐标
+        PubSentrySerial.holder_point_y=_RmSerialData[17]/100.0;        //云台手Y坐标
+        PubSentrySerial.ResidualAmmunition=_RmSerialData[18];          //允许发弹量
+
+        //--------------------------------------阵营判断-------------------------------------------
+        // 0红方 1蓝方 (与哨兵电控约定一致)
+        if(_RmSerialData[9] == 0)
             camp = 'r';
-
-        if(_RmSerialData[10] == 0)
-            shootflag = 'a';
-        else if(_RmSerialData[10] == 1)
-            shootflag = 'f';
         else
-            shootflag = 'a';//默认装甲板
-            
-        bv = _RmSerialData[11] / 100.0; 
+            camp = 'b';
+
+        //--------------------------------------模式判断-------------------------------------------
+        // 电控侧没有按f切换能量机关的逻辑, 这里写死打符模式
+        // (shootFlag 已在构造函数前由 launch 参数 shootflag 决定, 默认 'f')
     }
+    //---------------------------------------------------------------------------------------
+
     //把imu消息和rm消息发布出去
     void PubRmSerialData()
     {
@@ -186,95 +233,51 @@ public:
         ImuData.linear_acceleration.z = PubSerialData.LinearAcceleration_Z = accel[2];
 
         PubSerialData.Camp = camp;
-        PubSerialData.ShootFlag = shootflag;
-        PubSerialData.BulletVec = bv;
+        PubSerialData.ShootFlag = shootFlag;    //写死 'f' 打符模式
+        PubSerialData.BulletVec = bullet_vec;   //哨兵弹速
 
         PubSerialData.header.stamp = ros::Time::now();
 
         Serial_Rm.publish(PubSerialData);
         Serial_Imu.publish(ImuData);
+        Serial_Sentry.publish(PubSentrySerial);
     }
+
     //从串口读到的数据
     void ReceiveSerial()
     {
-        // Readcom_imu() reports true only after a complete validated IMU frame.
-        if(Sp.Readcom_imu(36))
+        // 仅在收到完整校验帧时才发布, 防止旧数据被反复发布
+        // (Fu节点用消息时间戳匹配图像, 旧姿态配新时间戳会导致预测点乱飘)
+        if(Sp.Readcom_imu(39))
         {
-            _RmSerialData = Sp.Rm_Serial_Data;
-        }
-        if(!_RmSerialData.empty()){
+            _RmSerialData = Sp.Rm_Serial_Data;  //串口赋值
             RmSerialDataInit();
             PubRmSerialData();
         }
-        _RmSerialData.clear();
     }
 
     //主线
     void Progress()
     {
-        //Sp.send_com_test();
-        ReceiveSerial();
-        //cout << angle << endl;
+        ReceiveSerial();            //读取电控数据模块
     }
+
+
 };
-
-void runSimulation(ros::NodeHandle& nh, ros::NodeHandle& private_nh)
-{
-    std::string shootflag_test = "a";
-    std::string camp_test = "r";
-    private_nh.param<std::string>("shootflag_test", shootflag_test, "a");
-    private_nh.param<std::string>("camp_test", camp_test, "r");
-
-    const char test_shootflag = !shootflag_test.empty() && shootflag_test[0] == 'f'
-        ? 'f' : 'a';
-    const char test_camp = !camp_test.empty() && camp_test[0] == 'b' ? 'b' : 'r';
-
-    ros::Publisher serial_publisher = nh.advertise<rm_msgs::RmSerial>("/RmSerialData", 1000);
-    ros::Publisher imu_publisher = nh.advertise<sensor_msgs::Imu>("imu/data_raw", 1000);
-    ros::Rate rate(100);
-
-    ROS_WARN("[serial] Simulation mode: ShootFlag=%c", test_shootflag);
-    while (ros::ok()) {
-        const ros::Time stamp = ros::Time::now();
-
-        rm_msgs::RmSerial serial_message;
-        serial_message.header.stamp = stamp;
-        serial_message.Qw = 1.0;
-        serial_message.Qx = 0.0;
-        serial_message.Qy = 0.0;
-        serial_message.Qz = 0.0;
-        serial_message.Camp = test_camp;
-        serial_message.ShootFlag = test_shootflag;
-        serial_message.BulletVec = 21.0;
-
-        sensor_msgs::Imu imu_message;
-        imu_message.header.stamp = stamp;
-        imu_message.header.frame_id = "imu_link";
-        imu_message.orientation.w = 1.0;
-        imu_message.linear_acceleration.z = 9.8;
-
-        serial_publisher.publish(serial_message);
-        imu_publisher.publish(imu_message);
-        ros::spinOnce();
-        rate.sleep();
-    }
-}
 
 int main(int argc, char *argv[])
 {
     ros::init(argc, argv, "serial");
     ros::NodeHandle nh;
-    ros::NodeHandle private_nh("~"); // 创建私有节点句柄
+    ros::NodeHandle private_nh("~");
 
-    // 从参数服务器获取配置文件路径
+    // 获取配置
     std::string config_path;
     private_nh.param<std::string>("armor_serial_config", config_path, "");
-    bool sim_mode = false;
-    private_nh.param<bool>("sim_mode", sim_mode, false);
-    if (sim_mode) {
-        runSimulation(nh, private_nh);
-        return 0;
-    }
+    std::string shootflag_param = "f";
+    private_nh.param<std::string>("shootflag", shootflag_param, "f");
+    double bullet_vec = 21.0;
+    private_nh.param<double>("bullet_vec", bullet_vec, 21.0);
 
     // 查找串口
     std::cout << "Searching for available serial port..." << std::endl;
@@ -296,24 +299,43 @@ int main(int argc, char *argv[])
     }
     std::cout << std::endl;
     if(!hasAvailable){
-        ROS_WARN("No available serial port; entering simulation mode");
-        runSimulation(nh, private_nh);
-        return 0;
+        std::cout << "No available serial port!" << std::endl;
+        std::cout << "Process will be shutdown after 3 second!" << std::endl;
+        std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+        return -1;
     }
     std::cout << "Have one serial matched:" << SPName << std::endl;
-    RmSerial rs(nh,config_path);
 
-    //订阅方 
+    RmSerial rs(nh, config_path);
+    // ShootFlag 写死: 电控没有按f切换能量机关的逻辑
+    if(shootflag_param == "a")
+        rs.shootFlag = 'a';
+    else
+    {
+        if(shootflag_param != "f")
+            ROS_WARN("[serial] 未知 shootflag='%s', 按打符模式 'f' 处理", shootflag_param.c_str());
+        rs.shootFlag = 'f';
+    }
+    rs.bullet_vec = (bullet_vec > 0.0) ? bullet_vec : 21.0;
+    ROS_INFO("[serial] ShootFlag='%c' (写死打符模式), BulletVec=%.2f", rs.shootFlag, rs.bullet_vec);
+
+    //订阅方
+    ros::Subscriber sub_cmd_vel = nh.subscribe("/cmd_vel" ,1000, &RmSerial::cmd_vel_callback,&rs);
     ros::Subscriber SubYolov8Data = nh.subscribe("/auto_angle",1000,&RmSerial::ReceiveYolov8,&rs);
-    thread th_process([&rs](){
-    while(ros::ok()){
-            ros::spinOnce();
-        }
-    });
-    th_process.detach();
+    ros::Subscriber sub_up_flag = nh.subscribe("/up_flag",1000,&RmSerial::up_flag_callback,&rs);
+    ros::Subscriber sub_speed_flag = nh.subscribe("/super_speed",1000,&RmSerial::super_speed_callback,&rs);
+    ros::Subscriber sub_lock_head = nh.subscribe("/lock_head",1000,&RmSerial::lock_head_callback,&rs);
+
     while(ros::ok())
     {
         rs.Progress();
+
+        ros::spinOnce();
+
+        // 持续发送16字节帧给电控: 速度 + 云台pitch/yaw角(能量机关预测角) + 标志位
+        rs.Sp.send_cmdvel(int(speed_x*100), int(speed_y*100), int(speed_w*100),
+                          (rs.angle.x * 1000), (rs.angle.y* 1000),
+                          1, up_flag, rs.signal, super_speed, lock_head);
     }
     return 0;
 }

@@ -9,6 +9,7 @@
 #include <string>
 
 #include "buff_detection_stabilizer.hpp"
+#include "buff_config.hpp"
 
 /**
  * @brief 能量机关(大/小符)识别器 — 单一 YOLO11 关键点模型, 替换旧的 YOLOV8_R + 传统CV
@@ -58,7 +59,8 @@ public:
     YoloBuffDetector(const std::string& model_path,
                      float conf_threshold = 0.2f,
                      float nms_threshold  = 0.2f,
-                     int   enemy_class    = 0);
+                     int   enemy_class    = 0,
+                     const std::string& model_device = "CPU");
 
     /// 取置信度最高的单个检测框 (小符)
     std::vector<BuffDetection> getBestBox(cv::Mat& image);
@@ -68,6 +70,17 @@ public:
 
     /// 设置敌方颜色: "blue"→识别class0(red), "red"→识别class1(blue)
     void setEnemyColor(const std::string& color);
+
+    /// 阈值/输入尺寸配置 (由 BuffRecognizer::configure 从 Buff 配置注入)
+    void configure(float conf_threshold, float nms_threshold, int input_size) {
+        conf_threshold_ = conf_threshold;
+        nms_threshold_  = nms_threshold;
+        if (input_size > 0) input_size_ = input_size;
+    }
+
+    /// 最近一次推理中敌方类别的最高置信度 (含被阈值过滤掉的候选), 丢检诊断用。
+    /// 用来区分"框就在阈值边上"(降阈值即可) 和"模型真的认不出"(要补训练数据)。
+    float lastBestConf() const { return last_best_conf_; }
 
 private:
     // OpenVINO 推理三件套
@@ -80,6 +93,8 @@ private:
     float conf_threshold_;
     float nms_threshold_;
     int   enemy_class_idx_;       // 0=red行(class_row=4), 1=blue行(class_row=5)
+    int   input_size_ = 640;      // 网络输入尺寸 (原硬编码 640)
+    float last_best_conf_ = 0.0f; // 最近一次推理的最高置信度(含被阈值过滤的)
 
     // YOLO11 输出格式常量
     static const int NUM_RAW_KPTS  = 9;   // 模型原始关键点数
@@ -94,8 +109,8 @@ private:
     /// 图像预处理: 等比缩放→640→BGR→RGB→/255→NCHW tensor, 返回坐标还原因子
     float fillTensor(cv::Mat& input_image);
 
-    /// 加载 OpenVINO 模型: read_model → compile_model(CPU) → create_infer_request
-    void initModel(const std::string& model_path);
+    /// 加载 OpenVINO 模型: read_model → compile_model(device) → create_infer_request
+    void initModel(const std::string& model_path, const std::string& model_device);
 };
 
 // ============================================================
@@ -108,7 +123,13 @@ public:
      * @param enemy_color 敌方颜色 "red" 或 "blue" (默认"blue")
      */
     BuffRecognizer(const std::string& model_path,
-                   const std::string& enemy_color = "blue");
+                   const std::string& enemy_color = "blue",
+                   const std::string& model_device = "CPU");
+
+    /// 识别参数注入 (由 Fu.cpp 从 Buff.recognition / Buff.model 载入,
+    /// 默认值=迁移前硬编码)
+    void configure(const buff::RecognitionConfig& config,
+                   const buff::ModelConfig& model);
 
     // ========== 首帧初始化 ==========
     /// YOLO推理 → remap → R中心精化 → 输出 R中心/扇叶中心/边长, 保存状态
@@ -188,6 +209,7 @@ private:
     // ========== 成员变量 ==========
     YoloBuffDetector detector_;
     BuffDetectionStabilizer stabilizer_;
+    buff::RecognitionConfig recog_;   // 识别参数 (默认值=迁移前硬编码)
 
     // 识别结果缓存 (最近一帧)
     cv::Point2f last_R_center_   = {0, 0};

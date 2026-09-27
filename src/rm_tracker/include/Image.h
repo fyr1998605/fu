@@ -73,15 +73,15 @@ class Image
 Image::Image()
 {
 	cv::Mat _cameraMatix = (cv::Mat_<double>(3, 3) <<
-			1692.72620365811, 0.363957161762693, 643.964129877484,
-			0, 1692.43288845269, 502.492890249832,
+			1329.24429634650, 0.518156995670085, 661.300343956123,
+			0, 1325.89618530323, 452.645884191168,
 			0, 0, 1
 		);
 	for (int i = 0; i < 3; i++)
 		for (int j = 0; j < 3; j++)
 			this->cameraMatrix.at<double>(i,j) = _cameraMatix.at<double>(i, j);
 	this->distCoeffs = (cv::Mat_<double>(1, 5) <<
-			-0.111874561711212, -0.000296513404483851, 0.884391394501360, -0.00202166770416446, -1.84111324474713
+			-0.0442540638030886, 0.0902922934048078, -0.00375815319429763, 0.00269367029458212, 0.0308390738152262
 		);
 	this->camera_center_compensate.x = this->camera_center.x = cameraMatrix.at<double>(0, 2);
 	this->camera_center_compensate.y = this->camera_center.y = cameraMatrix.at<double>(1, 2);
@@ -136,15 +136,15 @@ Image::Image(string file)
 void Image::Init_Camera_Inside()
 {
 	cv::Mat _cameraMatix = (cv::Mat_<double>(3, 3) <<
-			1692.72620365811, 0, 0,
-			0.363957161762693, 1692.43288845269, 0,
-			643.964129877484, 502.492890249832, 1
+			1329.24429634650, 0, 0,
+			0.518156995670085, 1325.89618530323, 0,
+			661.300343956123, 452.645884191168, 1
 		);
 	for (int i = 0; i < 3; i++)
 		for (int j = 0; j < 3; j++)
 			this->cameraMatrix.at<double>(j, i) = _cameraMatix.at<double>(i, j);
 	this->distCoeffs = (cv::Mat_<double>(1, 5) <<
-			-0.111874561711212, -0.000296513404483851, 0.884391394501360, -0.00202166770416446, -1.84111324474713
+			-0.0442540638030886, 0.0902922934048078, -0.00375815319429763, 0.00269367029458212, 0.0308390738152262
 		);
 
 	this->camera_center.x = cameraMatrix.at<double>(0, 2);

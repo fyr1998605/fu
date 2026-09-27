@@ -1,10 +1,261 @@
 # Fu-only configuration. Do not put armor auto-aim settings in this file.
 
+# ============================================================
+#  能量机关 (Buff) 可调参数 —— 调参只改这一节
+#
+#  加载方式: Fu 节点通过 fu_config_path 用 yaml-cpp 直接解析本文件
+#            (与自瞄 RmTracker::setParam / ModelObserver::setParam 同一套做法)
+#  取值优先级: launch <param>  >  本 Buff: 节  >  下方旧扁平键(过渡期)  >  代码默认值
+#  本文件不写某个键 = 使用代码默认值, 而代码默认值 == 迁移前的硬编码值
+#  启动后 Fu 节点会打印 "[Fu][cfg] Buff.xxx = yyy", 用它确认参数是否真的生效
+#  超范围/类型错误的值会被回落到安全值, 并在启动时以 [Fu] 警告打印出来
+# ============================================================
+Buff:
+  # ---------------- IMU / 图像 时间同步 ----------------
+  sync:
+    imu_pose_history_capacity: 200     # IMU 位姿历史长度
+    max_imu_image_skew_seconds: 0.05   # 图-IMU 最大允许时差(s), 超过则本帧不用 IMU 姿态
+    imu_stamp_offset_seconds: 0.0      # IMU 时间戳偏移(s); IMU 比相机快时填正值
+    quaternion_norm_min: 0.9           # 四元数模长有效下界
+    quaternion_norm_max: 1.1           # 四元数模长有效上界
+
+  # ---------------- 时延 / 提前量 / 兜底 ----------------
+  timing:
+    delta_t_init: 0.3                  # 提前量初值(s): 首帧飞行时间算出之前使用
+    delta_t_compensation: 0.3         # 程序耗时 + 发弹时间补偿(s)   ★最常调
+    delta_t_min: 0.01                  # 提前量下限(s)
+    delta_t_max: 1.0                   # 提前量上限(s)
+    flight_time_iterations: 2          # 世界EKF分支的飞行时间迭代次数
+    flight_time_valid_min: 0.01        # 飞行时间有效下限(s)
+    flight_time_valid_max: 2.0         # 飞行时间有效上限(s)
+    lead_ema_old: 0.8                  # 提前量 EMA: 旧值权重
+    lead_ema_new: 0.2                  # 提前量 EMA: 新值权重
+    max_coast_frames: 12               # 检测丢失时外推续跟上限(帧); 0=关闭续跟, 直接回保底
+    fallback_fps: 120.0                # 兜底帧率 EMA 初值
+    fallback_fps_ema_old: 0.9          # 兜底帧率 EMA: 旧值权重
+    fallback_fps_ema_new: 0.1          # 兜底帧率 EMA: 新值权重
+    fps_interval_max_ms: 500.0         # 帧间隔超过此值就不参与帧率估计(ms)
+    angle_cache_len: 300               # 角度差分缓存长度
+    default_omega: 1.047               # 最后兜底角速度(rad/s), 即 60°/s
+    kalman_bad_frames: 20              # 卡尔曼连续坏帧达到此值 -> 切角度差分兜底
+    divergence_min_radius_px: 1.0      # 发散检测生效的最小半径(px)
+    divergence_radius_ratio_min: 0.3   # 预测点到圆心距离下限(×半径)
+    divergence_radius_ratio_max: 3.5   # 预测点到圆心距离上限(×半径)
+
+  # ---------------- 云台下发 / 限幅 / 卡死恢复 ----------------
+  control:
+    pitch_compensation: 0.02           # pitch 补偿(rad)  增大往上
+    yaw_compensation: -0.02              # yaw 补偿(rad)    增大往左
+    gimbal_pose_alpha: 0.30            # 云台位姿 EMA 系数 (原 buff_pnp_solver.hpp 写死 0.30)
+    pitch_max_deg: 22.0                # 下发 pitch 软上限(deg)
+    pitch_min_deg: -15.0               # 下发 pitch 软下限(deg)
+    stuck_threshold_deg: 19.0          # 判定云台卡死的 pitch 阈值(deg)
+    stuck_frames: 30                   # 连续超阈值多少帧后触发恢复
+    recovery_pitch_deg: -10.0          # 恢复时强制下压的 pitch(deg)
+    recovery_frames: 15                # 恢复持续帧数
+    log_throttle_s: 0.2                # 下发角度日志节流(s)
+
+  # ---------------- PnP / 弹道 / 相位 ----------------
+  ballistic:
+    default_velocity: 24.0             # 串口弹速无效时的兜底弹速(m/s)
+    velocity_min_valid: 10.0           # 串口弹速有效门限(m/s), 低于它就用 default_velocity
+    gravity: 9.8                       # 重力加速度
+    iteration_times: 30                # 弹道迭代上限
+    converge_epsilon: 0.0001           # 弹道迭代收敛阈值(m)
+    height_tolerance: 0.01             # 迭代结束后的高度差门限(m)
+    angle_limit_deg: 60.0              # gun_yaw/gun_pitch_raw 的"解算异常"门限(deg)。
+                                       # 上机日志: 目标在侧面时 gun_yaw 平滑长到 -31~-35°,
+                                       # 被 29.7° 卡住 -> 整帧拒绝 -> 云台停 -> 误差更大 -> 永久锁死。
+                                       # 60° 仍能挡住真正的野值跳变, 但不会在正常跟随时锁死。
+    phase_probe_rad: 0.30              # 相位符号探针角(rad)
+    probe_valid_rad: 0.015             # 探针信号有效性下限(rad)
+    physical_phase_limit_rad: 2.5      # 单帧物理相位变化上限(rad)
+    max_reprojection_error_px: 12.0    # 重投影误差门限(px)
+    reprojection_check_enabled: false  # 是否启用重投影校验(原代码中该检查被注释)
+    optical_center_offset_x: -23.0     # 空间角主点人为偏移(px)
+    optical_center_offset_y: 24.0      # 空间角主点人为偏移(px)
+
+  # ---------------- 模型 / 模式 / 推理 ----------------
+  model:
+    model_path: Model/fu_moxi/buff_repvgg.xml   # Buff 关键点模型 (OpenVINO IR)
+    enemy_color: blue                           # blue | red (要打的敌方颜色)
+    move_mode: auto                             # small | big | auto
+    run_without_serial: false                   # 无串口也跑打符(调试)
+    functional_default: true                    # 串口未下发 ShootFlag 前默认打符
+    input_size: 640                             # 网络输入尺寸
+    model_device: CPU                           # 推理设备
+
+  # ---------------- 识别 (YOLO 阈值 / R中心精化 / 时序关联) ----------------
+  recognition:
+    conf_threshold: 0.08               # YOLO 置信度阈值(原 0.2)。
+                                       # 丢检日志实测 max_conf 在 0.105~0.113 之间徘徊,
+                                       # 被 0.2 全数拦掉; 0.08 能捞回这一批。
+                                       # 注意 max_conf=0.000~0.063 的那批是模型完全无响应, 降阈值救不了。
+    nms_threshold: 0.2                 # NMS IoU 阈值
+    binary_threshold: 120              # R中心精化二值化阈值
+    dilate_kernel_size: 5              # 膨胀核尺寸
+    r_center_mask_ratio: 0.8           # 圆形 mask 半径比例
+    r_center_contour_div: 3.0          # 轮廓评分距离惩罚因子
+    r_center_refine_max_shift: 5.0     # R中心精化最大位移(px)
+    box_alpha: 0.3                     # 检测框 EMA 系数
+    stabilizer_alpha: 0.9              # 几何 EMA 系数
+    assoc_gate_min_px: 20.0            # 时序关联门限下限(px)
+    assoc_gate_radius_ratio: 1.2       # 时序关联门限 = max(min, 半径×比例)
+    jump_fan_radius_ratio: 0.55        # 扇叶帧间跳变判定比例
+    jump_r_radius_ratio: 0.35          # R中心帧间跳变判定比例
+    radius_change_reject_ratio: 0.50   # 半径变化率拒绝门限
+    side_change_reject_ratio: 0.50     # 边长变化率拒绝门限
+    jump_confirm_frames: 3             # 跳变需连续几帧确认
+    reacquire_confirm_frames: 3        # 重捕获需连续几帧确认
+    miss_reset_frames: 3               # 丢帧滞回: 连续多少帧空结果/关联失败才清 has_prev_(单帧miss不清)
+    min_valid_radius_px: 1.0           # 有效性保护最小半径(px)
+    ego_motion_max_delta_rad: 0.262    # 自运动补偿云台跳变上限(15°)
+
+  # ---------------- 靶面几何 / 相机标定 ----------------
+  geometry:
+    target_width_mm: 300.0             # PnP 靶面宽度
+    target_height_mm: 300.0            # PnP 靶面高度
+    camera_matrix: [1329.24429634650,0.518156995670085,  661.300343956123,
+                    0, 1325.89618530323,452.645884191168, 0, 0, 1]
+    dist_coeffs: [-0.0442540638030886,0.0902922934048078  ,
+                  -0.00375815319429763, 0.00269367029458212, 0.0308390738152262]
+    radius_mm: 650.0                   # 能量机关半径(mm); 0=让世界EKF自学习
+    hub_normal_offset_mm: 0.0          # 中心hub法向偏移(mm)
+
+  # ---------------- 角度处理 + 小符像素卡尔曼 ----------------
+  angle:
+    blade_count: 5                     # 扇叶数 (2π/5 周期)
+    direction_judge_samples: 21        # 转向判定样本数
+    wrap_period: 6.283185              # 圈数修正周期 2π
+    unwrap_tolerance_divisor: 6.55     # 补角容差 2π/6.55
+    diff_search_start_ratio: 0.5       # 差分搜索起点比例
+    diff_timeout_margin_ms: 80.0       # 差分超时容差(ms)
+    diff_angle_limit_rad: 1.169        # 差分角异常门限(67°)
+    direction_filter_ratio: 0.028      # 方向判定滤波: 相邻差分角 π×该值 (≈5°)
+    angle_buffer_len: 300              # 角度历史缓存上限
+    sector_search_range: 6             # 补角搜索范围 ±6
+    image_width: 1280                  # 图像宽(需与相机一致)
+    image_height: 1024                 # 图像高(需与相机一致)
+    small_buff_converge_delay: 5       # 小符方向收敛帧数
+    small_buff_max_roll_residual: 0.55 # 小符新息拒绝阈值(rad)
+    small_buff_min_speed: 0.052        # 小符最小|ω|
+    small_buff_max_speed: 1.571        # 小符最大|ω|(90°/s)
+    small_buff_phase_process_noise: 0.005    # 小符相位过程噪声 Q
+    small_buff_phase_measurement_noise: 0.004  # 小符相位观测噪声 R
+    small_buff_min_radius_px: 1.0      # 最小半径门限(px)
+    small_buff_max_dt: 0.5             # dt 有效上限(s)
+    small_buff_reject_reset_count: 3   # 连续拒绝几帧 reset
+    small_buff_vote_min_phase_delta: 0.002  # 投票生效最小相位差
+    small_buff_vote_saturation: 20     # 方向投票饱和值
+    small_buff_omega_fit_min_samples: 5  # ω线性拟合最少样本
+    small_buff_radius_ema: 0.1         # 半径 EMA 新值权重
+    small_buff_center_ema: 0.2         # 圆心 EMA 新值权重
+    small_buff_center_snap_ratio: 0.3  # R中心瞬跳吸附阈值(×半径); 超过就直接吸附不走EMA, 0=总是吸附
+    small_buff_omega_reset_cov: 0.02   # 重置后 ω 协方差
+    small_buff_omega_locked_cov: 0.05  # 锁定后 ω 协方差
+    small_buff_init_cov_phase: 0.10    # 初始相位协方差
+    small_buff_init_cov_omega: 0.50    # 初始 ω 协方差
+    small_buff_phase_history_max: 20   # 相位历史长度
+
+  # ---------------- 旧 FFT/Ceres 大符预测器 + 小符速度估计 ----------------
+  legacy_predictor:
+    big_min_init_samples: 6            # 大符初始化最少样本
+    big_const_level: 1.1775            # 大符基线均值系数(×delta_t)
+    big_const_omega: 1.924             # 大符角速度定值(rad/s)
+    big_angular_speed: 2.090           # 大符振幅公式常数
+    ceres_trigger_factor: 2            # Ceres 触发样本数 = fps×π×该值
+    big_jump_ratio: 0.014              # 大符突变差分角门限(π×该值)
+    big_moving_average_window: 7       # 滑动平均窗口
+    big_min_judge_samples: 21          # 升降判定最少样本
+    big_smooth_lookback_seconds: 0.10  # 极值附近平滑回看(s)
+    big_initial_phase: 0.75            # 初相位估计定值
+    ceres_max_num_iterations: 500      # Ceres 最大迭代
+    ceres_function_tolerance: 1.0e-15  # Ceres 函数值容差
+    ceres_gradient_tolerance: 1.0e-15  # Ceres 梯度容差
+    ceres_parameter_tolerance: 1.0e-15 # Ceres 参数容差
+    ceres_num_threads: 2               # Ceres 线程数
+    big_fit_max_level: 1.310           # 拟合最大基线(×delta_t)
+    big_fit_max_omega: 2.000           # 拟合最大角速度
+    big_fit_min_level: 1.045           # 拟合最小基线(×delta_t)
+    big_fit_min_omega: 1.884           # 拟合最小角速度
+    big_forced_omega: 2.0              # 拟合结果强制覆盖角速度
+    big_extreme_wait_seconds: 0.2      # 极值后冻结时长(s)
+    big_vote_lookback_near: 5          # 升降表决回看帧 1
+    big_vote_lookback_mid: 10          # 升降表决回看帧 2
+    big_vote_lookback_far: 15          # 升降表决回看帧 3
+    big_smooth_window: 5               # 极值附近平滑窗口
+    small_min_init_samples: 10         # 小符初始化最少样本
+    small_jump_ratio: 0.028            # 小符突变门限(π×该值)
+    small_init_timeout_frames: 60      # 小符初始化超时帧数
+    small_default_omega: 1.0471975511965976  # 小符保底角速度 π/3 (60°/s)
+    small_ema_update_period: 30        # 小符速度 EMA 更新周期
+    small_recent_window: 60            # 小符最近样本窗口
+    small_speed_ema_alpha: 0.3         # 小符速度 EMA 系数
+    small_smooth_ema_old: 0.75         # 小符输出 EMA 旧值权重
+    small_smooth_ema_new: 0.25         # 小符输出 EMA 新值权重
+    mode_detector_window_samples: 60   # 大小符判别: 扫描窗口样本数
+    mode_detector_minimum_samples: 12  # 大小符判别: 最小有效样本数
+    mode_detector_evaluate_every: 10   # 大小符判别: 每 N 样本评估一次
+    mode_detector_confirmations: 3     # 大小符判别: 模式切换确认次数
+    mode_detector_max_sample_jump_ratio: 0.014  # 大小符判别: 突变剔除门限(π×该值)
+    mode_detector_big_threshold_ratio: 0.60     # 大小符判别: 大符振幅比阈值
+    mode_detector_small_threshold_ratio: 0.40   # 大小符判别: 小符振幅比阈值
+
+  # ---------------- 大符 ZJU RANSAC 正弦模型 ----------------
+  big_ransac:
+    enabled: false                     # 关闭整条 RANSAC 链(与旧 buff_big_ransac_enabled 一致)
+    max_iterations: 200
+    threshold: 0.5
+    min_omega: 1.884
+    max_omega: 2.0
+    min_amplitude: 0.780
+    max_amplitude: 1.045
+    min_inliers: 100
+    max_abs_speed: 3.2
+    max_gap_seconds: 5.0
+    max_consecutive_rejections: 30
+    random_seed: 24301                # 0x5EED
+
+  # ---------------- 世界系 EKF ----------------
+  world_tracker:
+    ekf_enabled: false
+    ekf_control_enabled: false
+    apply_gimbal_pose: true
+    quaternion_is_imu_to_map: true
+    center_measurement_std_m: 0.05     # 中心观测噪声 R(与旧键 0.05 一致)
+    normal_measurement_std_rad: 0.05
+    phase_measurement_std_rad: 0.05
+    center_process_std_mps: 0.015
+    normal_process_std_radps: 0.05
+    omega_process_std_radps2: 0.40
+    min_omega: 0.15                    # ready 最小 ω
+    max_omega: 1.571                   # ω 上限(90°/s)
+    direction_lock_omega: 0.25         # 方向锁 ω 阈值
+    direction_lock_frames: 15          # 方向锁帧数
+    ready_enter_frames: 10             # ready 进入滞回
+    ready_exit_frames: 15              # ready 退出滞回
+    residual_gate_sigma: 3.5           # Mahalanobis 野值门限(σ)
+    phase_process_noise_floor: 1.0e-5  # 相位过程噪声下限
+    omega_init_abs: 0.9                # 锁定后 ω 偏置
+    omega_ema_fast: 0.5                # 前几帧 ω 注入 EMA
+    omega_ema_slow: 0.03               # 之后 ω 注入 EMA
+    omega_ema_fast_frames: 8           # 快 EMA 帧数分界
+    reverse_omega_reject_threshold: 0.30  # 反向 ω 拒绝阈值
+    min_time_diff_seconds: 0.02        # 差分最小间隔
+    omega_clamp_start_frames: 4        # ω 限幅启动帧数
+    min_radius_m: 0.05                 # 半径有效性门限(m)
+    min_dt_seconds: 1.0e-4             # dt 下限
+    max_dt_seconds: 1.0                # dt 上限
+    minimum_observations: 5            # ready 最小帧数
+    max_prediction_seconds: 1.0        # 预测时域上限
+    normal_pitch_limit_deg: 90.0       # 法线 pitch 限幅
+    init_covariance_scale: 1.0e3       # 初始协方差放大倍数
+
 # Fu PnP calibration: adjust target width/height, camera matrix, and distortion below.
 buff_target_width_mm: 300.0
 buff_target_height_mm: 300.0
-buff_camera_matrix: [1725.43995732677, 2.25709283659612, 650.619179581647, 0.0, 1725.73107878698, 502.595484269405, 0.0, 0.0, 1.0]
-buff_dist_coeffs: [-0.0411501174535933, -0.0281180450824966, 0.000526367183877240, -0.00168702406688350, 1.665885925382968]
+buff_camera_matrix: [1329.24429634650, 0.518156995670085, 661.300343956123, 0, 1325.89618530323, 452.645884191168, 0, 0, 1]
+buff_dist_coeffs: [-0.0442540638030886, 0.0902922934048078, -0.00375815319429763, 0.00269367029458212, 0.0308390738152262]
 
 # ============================================================
 #        能量机关 世界坐标系 EKF (扩展卡尔曼滤波) 完整参数手册
@@ -24,12 +275,33 @@ buff_dist_coeffs: [-0.0411501174535933, -0.0281180450824966, 0.00052636718387724
 # ============================================================
 
 # -------------------- 开关 & 物理参数 --------------------
-buff_world_ekf_enabled: true                  # [开关] 是否启用 EKF, false 则直接用 PnP 原始值
-buff_world_ekf_control_enabled:  true         # [开关] EKF 控制输入(云台反馈)是否启用
+buff_world_ekf_enabled: false                 # [开关] 本轮基线实验关闭世界 EKF
+buff_world_ekf_control_enabled: false         # [开关] 本轮基线实验关闭世界 EKF 控制输入
+buff_world_apply_gimbal_pose: true           # [开关] 世界观测/控制链叠加云台实时位姿
+                                             #   true=相机系先经云台位姿转车体系(推荐)
+                                             #   false=旧行为(云台摆动时观测出现米级假运动)
 buff_quaternion_is_imu_to_map: true           # [方向] 四元数旋转方向, 一般不改
 buff_imu_stamp_offset_seconds: 0.0            # [同步] IMU 时间戳偏移(秒), IMU比相机快时填正值
+                                             #       过渡期重复键: 新家是 Buff.sync.imu_stamp_offset_seconds
+                                             #       两处必须一致 (P3 切换读取方式后会删除本键)
 buff_radius_mm: 650.00                        # [尺寸] 能量机关半径(mm), 中心→装甲板距离
 buff_hub_normal_offset_mm: 0.0                # [尺寸] 中心hub法向偏移(mm), 一般=0
+
+# Zhejiang University large-buff sine-model adapter. The existing predictor
+# remains the fallback until this model reaches min_inliers.
+# Select small/big explicitly, or use auto for lightweight runtime switching.
+buff_move_mode: auto
+buff_big_ransac_enabled: false                # 本轮基线实验关闭大符 RANSAC
+buff_big_ransac_max_iterations: 200
+buff_big_ransac_threshold: 0.5
+buff_big_ransac_min_omega: 1.884
+buff_big_ransac_max_omega: 2.0
+buff_big_ransac_min_amplitude: 0.780
+buff_big_ransac_max_amplitude: 1.045
+buff_big_ransac_min_inliers: 100
+buff_big_ransac_max_abs_speed: 3.2
+buff_big_ransac_max_gap_seconds: 5.0
+buff_big_ransac_max_consecutive_rejections: 30
 
 # ============================================================
 #  观测噪声 R (Measurement Noise) —— "PnP 测量值有多不准?"
@@ -43,13 +315,15 @@ buff_hub_normal_offset_mm: 0.0                # [尺寸] 中心hub法向偏移(m
 #   ✗ 输出跟不上目标旋转 → 观测噪声太大, 应减小 R
 #   ✗ 输出在目标附近抖动 → 观测噪声太小, 应增大 R
 
-buff_world_center_measurement_std_m: 0.015
+buff_world_center_measurement_std_m: 0.05
   # [观测噪声-R] 中心位置测量标准差(米)
   # PnP 解算出的旋转中心的"可信度"
   # 0.01=很信PnP中心 / 0.05=不太信PnP中心
   # 推荐: 0.015 ~ 0.05
+  # 注意: 9m 距离上 PnP 实际噪声约 0.03~0.1m, 0.015 过小会放大野值冲击;
+  # 该值同时决定 EKF 的野值门限(3.5σ), 改小会让正常观测也被丢弃。
 
-buff_world_normal_measurement_std_rad: 0.030
+buff_world_normal_measurement_std_rad: 0.05
   # [观测噪声-R] 法向量角度测量标准差(弧度)
   # PnP 解算出的平面朝向的"可信度"
   # 推荐: 0.02 ~ 0.10
@@ -123,23 +397,27 @@ buff_world_omega_process_std_radps2: 0.40
 # Fu coordinate conversion: camera -> IMU -> gun. Units are metres/radians.
 CoordinateTransformer:
   'off':
-    imu2Map_trans_off_x: 0.0
-    imu2Map_trans_off_y: 0.0
-    imu2Map_trans_off_z: 0.055
+    imu2Map_trans_off_x: 0
+    imu2Map_trans_off_y: 0
+    imu2Map_trans_off_z: 0.07084
+    # 陀螺仪 -> 相机 旋转偏移量
     cam2Imu_rpy_off_roll: -1.57079632679489661923
-    cam2Imu_rpy_off_pitch: 0.0
+    cam2Imu_rpy_off_pitch: 0
     cam2Imu_rpy_off_yaw: -1.57079632679489661923
-    cam2Imu_trans_off_x: 0.135
-    cam2Imu_trans_off_y: 0.0
-    cam2Imu_trans_off_z: -0.012
-    gun2Imu_rpy_off_roll: 0.0
-    gun2Imu_rpy_off_pitch: 0.0
-    gun2Imu_rpy_off_yaw: 0.0
+    # 陀螺仪 -> 相机 平移偏移量0.08169
+    cam2Imu_trans_off_x: 0.08169
+    cam2Imu_trans_off_y: 0
+    cam2Imu_trans_off_z: -0.03612
+    # 陀螺仪 -> 枪管 旋转偏移量
+    gun2Imu_rpy_off_roll: 0
+    gun2Imu_rpy_off_pitch: 0
+    gun2Imu_rpy_off_yaw: 0
+    # 陀螺仪 -> 枪管 平移偏移量
     gun2Imu_trans_off_x: 0.14524
-    gun2Imu_trans_off_y: 0.0
-    gun2Imu_trans_off_z: -0.055
+    gun2Imu_trans_off_y: 0
+    gun2Imu_trans_off_z: -0.07084
 
 # This Camera section is not used by the active Fu aiming path; do not tune it for Fu PnP.
 Camera:
-  camera_matrix: [1725.43995732677, 2.25709283659612, 650.619179581647, 0.0, 1725.73107878698, 502.595484269405, 0.0, 0.0, 1.0]
-  dist_coeffs: [-0.0411501174535933, -0.0281180450824966, 0.000526367183877240, -0.00168702406688350, 1.665885925382968]
+  camera_matrix: [1329.24429634650, 0.518156995670085, 661.300343956123, 0, 1325.89618530323, 452.645884191168, 0, 0, 1]
+  dist_coeffs: [-0.0442540638030886, 0.0902922934048078, -0.00375815319429763, 0.00269367029458212, 0.0308390738152262]
