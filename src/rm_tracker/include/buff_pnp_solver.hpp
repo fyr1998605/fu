@@ -14,7 +14,9 @@ extern int g_buff_rotation_sign;
 class PnPSolver_gravity
 {
 public:
-
+double lastReprojectionError() const {
+    return last_reprojection_error_;
+}
 // Debug only: compare both quaternion directions without affecting the
 // existing camera -> gun -> trajectory -> /auto_angle control path.
 void logImuImageSync(const Eigen::Vector3d& target_cam_m) const//打印IMU和相机同步信息
@@ -23,7 +25,7 @@ void logImuImageSync(const Eigen::Vector3d& target_cam_m) const//打印IMU和相
         ROS_WARN_THROTTLE(
             1.0,
             "[BUFF_SYNC] no IMU match for image stamp %.6f; history=%zu",
-            g_frame_image_stamp.toSec(), g_imu_pose_history.size());
+            g_frame_image_stamp.seconds(), g_imu_pose_history.size());
         return;
     }
     if (g_coorConverter == nullptr) {
@@ -46,7 +48,7 @@ void logImuImageSync(const Eigen::Vector3d& target_cam_m) const//打印IMU和相
         "[BUFF_SYNC] img=%.6f imu=%.6f skew=%+.2fms q_norm=%.6f "
         "q=(%.6f,%.6f,%.6f,%.6f) cam=(%.3f,%.3f,%.3f) "
         "direct=(%.3f,%.3f,%.3f) inverse=(%.3f,%.3f,%.3f)",
-        g_frame_image_stamp.toSec(), g_frame_imu_pose.stamp.toSec(),
+        g_frame_image_stamp.seconds(), g_frame_imu_pose.stamp.seconds(),
         g_frame_imu_image_skew_seconds * 1000.0,
         g_frame_imu_pose.raw_norm,
         q.w(), q.x(), q.y(), q.z(),
@@ -223,7 +225,7 @@ bool buildWorldObservation(const cv::Point2f& top, const cv::Point2f& left,
         ? quaternion_rotation : quaternion_rotation.transpose();
     const Eigen::Vector3d map_translation = g_coorConverter->imu2Map_trans_mat;
 
-    observation.stamp_seconds = g_frame_image_stamp.toSec();
+    observation.stamp_seconds = g_frame_image_stamp.seconds();
     observation.target_center_map = imu_to_map_rotation *
         g_coorConverter->cam2Imu(target_center_cam) + map_translation;
     observation.r_center_map = imu_to_map_rotation *

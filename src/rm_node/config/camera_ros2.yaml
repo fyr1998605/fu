@@ -1,0 +1,15 @@
+hikcamera:
+  ros__parameters:
+    width: 1280
+    height: 1024
+    Offset_x: 0
+    Offset_y: 0
+    FrameRateEnable: true
+    FrameRate: 120
+    ExposureTime: 3000
+    GammaEnable: false
+    Gamma: 1.0
+    GainAuto: 2
+    Gain: 0.5
+    SaturationEnable: false
+    Saturation: 128

@@ -1,319 +1,214 @@
-#include <ros/ros.h>
-#include "Serial.h"
-#include "rm_msgs/RmSerial.h"
-#include "sensor_msgs/Imu.h"
-#include "geometry_msgs/Vector3.h"
-#include "tf2/LinearMath/Quaternion.h"
-#include <thread>
-#include <string>
-#include <chrono>
+#include <cerrno>
 #include <fstream>
+#include <memory>
+#include <string>
+
+#include <geometry_msgs/msg/vector3.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <tf2/LinearMath/Quaternion.h>
 #include <yaml-cpp/yaml.h>
-using namespace std;
 
-static std::string SPName = "/dev/ttyUSB0";
-constexpr char* SerialPrefix = "/dev/";
-const std::string Prefix[] = {"ttyUSB","ttyACM","ttyCH343USB"};
-constexpr int Upper = 10; 
-constexpr int Lower = 0;
+#include "Serial.h"
+#include "rm_msgs/msg/rm_serial.hpp"
 
-class RmSerial
-{  
-public: 
-    double roll, pitch, yaw, gyro[3],accel[3],bv;
-    char camp, shootflag;
-    vector<int> _RmSerialData;
-    geometry_msgs::Vector3 angle;
-    std::string config_path_; //存储配置路径
-    double m_rollOffset = 0;
-    double m_pitchOffset = 0;
-    double m_yawOffset = 0;
+namespace {
+std::string g_serial_port_name = "/dev/ttyUSB0";
+constexpr char kSerialPrefix[] = "/dev/";
+const std::string kPortPrefixes[] = {"ttyUSB", "ttyACM", "ttyCH343USB"};
+constexpr int kPortUpperBound = 10;
 
-    //串口函数
-    SerialPort Sp;
-    //自定义消息
-    rm_msgs::RmSerial PubSerialData;
-    //Imu消息
-    sensor_msgs::Imu ImuData;
-    //发布方
-    ros::Publisher Serial_Imu;
-    ros::Publisher Serial_Rm;
+class RmSerialNode : public rclcpp::Node {
+ public:
+  explicit RmSerialNode() : Node("serial") {
+    config_path_ = declare_parameter<std::string>("armor_serial_config", "");
+    sim_mode_ = declare_parameter<bool>("sim_mode", false);
+    shootflag_test_ = declare_parameter<std::string>("shootflag_test", "a");
+    camp_test_ = declare_parameter<std::string>("camp_test", "r");
 
-    void ReceiveYolov8(const geometry_msgs::Vector3ConstPtr autoAngle)
-    {
-        angle = *autoAngle;
-        Sp.Sendcom(angle.x * 1000, angle.y * 1000,angle.z);
-        // ROS_DEBUG("serial send is ok hahahahaha");
-        // cout << "Sub:" << angle << endl;
+    serial_pub_ = create_publisher<rm_msgs::msg::RmSerial>("/RmSerialData", 1000);
+    imu_pub_ = create_publisher<sensor_msgs::msg::Imu>("imu/data_raw", 1000);
+    angle_sub_ = create_subscription<geometry_msgs::msg::Vector3>(
+        "/auto_angle", 1000,
+        std::bind(&RmSerialNode::receive_angle, this, std::placeholders::_1));
+
+    if (sim_mode_) {
+      RCLCPP_WARN(get_logger(), "[serial] Simulation mode: ShootFlag=%c",
+                  test_shoot_flag());
+      timer_ = create_wall_timer(std::chrono::milliseconds(10),
+                                 std::bind(&RmSerialNode::publish_simulation, this));
+      return;
     }
 
-    void setParam(const std::string &file_path) {
-        try{
-            // 1. 文件存在性检查
-            if (file_path.empty()) {
-                ROS_ERROR("Empty config file path provided");
-                return;
-            }
+    if (!find_serial_port()) {
+      RCLCPP_WARN(get_logger(), "No available serial port; entering simulation mode");
+      sim_mode_ = true;
+      timer_ = create_wall_timer(std::chrono::milliseconds(10),
+                                 std::bind(&RmSerialNode::publish_simulation, this));
+      return;
+    }
 
-            // 2.检查文件是否打开
-            std::ifstream file_check(file_path);
-            if (!file_check.is_open()) {
-                ROS_ERROR("Failed to open config file: %s. Reason: %s", 
-                        file_path.c_str(), strerror(errno));
-                return;
-            }
-            ROS_INFO("Loading parameters from: %s", file_path.c_str());
+    serial_port_ = std::make_unique<SerialPort>(g_serial_port_name.c_str(), 36);
+    load_config();
+    timer_ = create_wall_timer(std::chrono::milliseconds(1),
+                               std::bind(&RmSerialNode::receive_serial, this));
+  }
 
-            // 3. 加载 YAML 文件并添加详细错误处理
-            YAML::Node config;
-            try {
-                config = YAML::LoadFile(file_path);
-            } catch (const YAML::BadFile& e) {
-                ROS_ERROR("Bad YAML file: %s", e.what());
-                return;
-            } catch (const YAML::ParserException& e) {
-                ROS_ERROR("YAML parsing error at line %d: %s", e.mark.line, e.what());
-                return;
-            }
+ private:
+  char test_shoot_flag() const {
+    return !shootflag_test_.empty() && shootflag_test_[0] == 'f' ? 'f' : 'a';
+  }
 
-            // 补偿误差函数加载
-            if (config["InstallOffset"])
-            {
-                YAML::Node mod = config["InstallOffset"];
-                m_rollOffset = mod["rollOffset"].as<double>(0);
-                m_pitchOffset = mod["pitchOffset"].as<double>(0);
-                m_yawOffset = mod["yawOffset"].as<double>(0);
-                // ROS_INFO("InstallOffset parameters loaded:");
-                // ROS_INFO("m_rollOffset:%.3f",m_rollOffset);
-                // ROS_INFO("m_pitchOffset:%.3f",m_pitchOffset);
-                // ROS_INFO("m_yawOffset:%.3f",m_yawOffset);
-                // ROS_INFO("InstallOffset parameters loaded successfully");
-            }
-            else
-            {
-                ROS_WARN("No 'CoordinateTransformer' section in config file");
-            }
+  char test_camp() const {
+    return !camp_test_.empty() && camp_test_[0] == 'b' ? 'b' : 'r';
+  }
+
+  bool find_serial_port() {
+    for (const auto &prefix : kPortPrefixes) {
+      for (int index = 0; index < kPortUpperBound; ++index) {
+        g_serial_port_name = std::string(kSerialPrefix) + prefix + std::to_string(index);
+        if (std::ifstream(g_serial_port_name.c_str()).good()) {
+          RCLCPP_INFO(get_logger(), "Using serial port %s", g_serial_port_name.c_str());
+          return true;
         }
-        catch (const YAML::Exception& e) {
-            ROS_ERROR("YAML parsing error: %s", e.what());
-        } 
-        catch (const std::exception& e) {
-            ROS_ERROR("Error loading parameters: %s", e.what());
-        } 
-        catch (...) {
-            ROS_ERROR("Unknown error occurred while loading config file");
-        }
+      }
+    }
+    return false;
+  }
+
+  void receive_angle(const geometry_msgs::msg::Vector3::ConstSharedPtr message) {
+    angle_ = *message;
+    if (serial_port_) {
+      serial_port_->Sendcom(angle_.x * 1000, angle_.y * 1000, angle_.z);
+    }
+  }
+
+  void load_config() {
+    if (config_path_.empty()) {
+      RCLCPP_WARN(get_logger(), "No configuration file path provided. Using default parameters.");
+      return;
     }
 
-    RmSerial(ros::NodeHandle &nh, const std::string& config_path):Sp(SPName.c_str(), 36) , config_path_(config_path)
-    {
-        Serial_Imu = nh.advertise<sensor_msgs::Imu>("imu/data_raw",1000);
-        Serial_Rm  = nh.advertise<rm_msgs::RmSerial>("/RmSerialData",1000);
+    try {
+      YAML::Node config = YAML::LoadFile(config_path_);
+      if (config["InstallOffset"]) {
+        const YAML::Node offsets = config["InstallOffset"];
+        roll_offset_ = offsets["rollOffset"].as<double>(0.0);
+        pitch_offset_ = offsets["pitchOffset"].as<double>(0.0);
+        yaw_offset_ = offsets["yawOffset"].as<double>(0.0);
+      } else {
+        RCLCPP_WARN(get_logger(), "No 'InstallOffset' section in serial config");
+      }
+    } catch (const YAML::Exception &error) {
+      RCLCPP_ERROR(get_logger(), "Failed to load serial config '%s': %s",
+                   config_path_.c_str(), error.what());
+    }
+  }
 
-        // 配置参数
-        if (!config_path_.empty()) {
-            try {
-                setParam(config_path_);
-                ROS_INFO("Successfully loaded parameters from: %s", config_path_.c_str());
-            } catch (const std::exception& e) {
-                ROS_ERROR("Failed to load parameters: %s", e.what());
-            }
-        } else {
-            ROS_WARN("No configuration file path provided. Using default parameters.");
-        }
+  void publish_simulation() {
+    const auto stamp = get_clock()->now();
+    rm_msgs::msg::RmSerial serial_message;
+    serial_message.header.stamp = stamp;
+    serial_message.qw = 1.0;
+    serial_message.qx = 0.0;
+    serial_message.qy = 0.0;
+    serial_message.qz = 0.0;
+    serial_message.camp = static_cast<std::int8_t>(test_camp());
+    serial_message.shoot_flag = static_cast<std::int8_t>(test_shoot_flag());
+    serial_message.bullet_vec = 21.0;
+
+    sensor_msgs::msg::Imu imu_message;
+    imu_message.header.stamp = stamp;
+    imu_message.header.frame_id = "imu_link";
+    imu_message.orientation.w = 1.0;
+    imu_message.linear_acceleration.z = 9.8;
+
+    serial_pub_->publish(serial_message);
+    imu_pub_->publish(imu_message);
+  }
+
+  void receive_serial() {
+    if (!serial_port_ || !serial_port_->Readcom_imu(36)) {
+      return;
+    }
+    const auto &data = serial_port_->Rm_Serial_Data;
+    if (data.size() < 12) {
+      RCLCPP_WARN(get_logger(), "Ignoring short serial frame with %zu values", data.size());
+      return;
     }
 
-    //从串口读到的数据进行赋值
-    void RmSerialDataInit()
-    {
+    const double roll = data[0] / 100000.0;
+    const double pitch = data[1] / 100000.0;
+    const double yaw = data[2] / 100000.0;
+    const double gyro_x = data[3] / 100000.0;
+    const double gyro_y = data[4] / 100000.0;
+    const double gyro_z = data[5] / 100000.0;
+    const double accel_x = data[6] / 100000.0;
+    const double accel_y = data[7] / 100000.0;
+    const double accel_z = data[8] / 100000.0;
+    const char camp = data[9] ? 'b' : 'r';
+    const char shoot_flag = data[10] == 1 ? 'f' : 'a';
 
-        roll     = _RmSerialData[0] / 100000.0;
-        pitch    = _RmSerialData[1] / 100000.0;
-        yaw      = _RmSerialData[2] / 100000.0;
-        gyro[0]  = _RmSerialData[3] / 100000.0;
-        gyro[1]  = _RmSerialData[4] / 100000.0;
-        gyro[2]  = _RmSerialData[5] / 100000.0;
-        accel[0] = _RmSerialData[6] / 100000.0;
-        accel[1] = _RmSerialData[7] / 100000.0;
-        accel[2] = _RmSerialData[8] / 100000.0;
-        // cout << "roll" << roll << endl;
-        // cout << "pitch" << pitch << endl;
-        // cout << "yaw" << yaw << endl;
-        // cout << "gyro[0]" << gyro[0] << endl;
-        // cout << "gyro[1]" << gyro[1] << endl;
-        // cout << "gyro[2]" << gyro[2] << endl;
-        // cout << "accel[0]" << accel[0] << endl;
-        // cout << "accel[1]" << accel[1] << endl;
-        // cout << "accel[2]" << accel[2] << endl;
+    tf2::Quaternion orientation;
+    orientation.setRPY(roll, pitch, yaw);
 
-        if(_RmSerialData[9])
-            camp = 'b';
-        else
-            camp = 'r';
+    const auto stamp = get_clock()->now();
+    rm_msgs::msg::RmSerial serial_message;
+    serial_message.header.stamp = stamp;
+    serial_message.roll = roll + roll_offset_;
+    serial_message.pitch = pitch + pitch_offset_;
+    serial_message.yaw = yaw + yaw_offset_;
+    serial_message.qw = orientation.w();
+    serial_message.qx = orientation.x();
+    serial_message.qy = orientation.y();
+    serial_message.qz = orientation.z();
+    serial_message.angular_velocity_x = gyro_x;
+    serial_message.angular_velocity_y = gyro_y;
+    serial_message.angular_velocity_z = gyro_z;
+    serial_message.linear_acceleration_x = accel_x;
+    serial_message.linear_acceleration_y = accel_y;
+    serial_message.linear_acceleration_z = accel_z;
+    serial_message.camp = static_cast<std::int8_t>(camp);
+    serial_message.shoot_flag = static_cast<std::int8_t>(shoot_flag);
+    serial_message.bullet_vec = data[11] / 100.0;
 
-        if(_RmSerialData[10] == 0)
-            shootflag = 'a';
-        else if(_RmSerialData[10] == 1)
-            shootflag = 'f';
-        else
-            shootflag = 'a';//默认装甲板
-            
-        bv = _RmSerialData[11] / 100.0; 
-    }
-    //把imu消息和rm消息发布出去
-    void PubRmSerialData()
-    {
-        tf2::Quaternion Q;
-        Q.setRPY(roll, pitch, yaw);
-        ImuData.header.frame_id = "imu_link";
-        ImuData.header.stamp = ros::Time::now();
+    sensor_msgs::msg::Imu imu_message;
+    imu_message.header.stamp = stamp;
+    imu_message.header.frame_id = "imu_link";
+    imu_message.orientation.w = orientation.w();
+    imu_message.orientation.x = orientation.x();
+    imu_message.orientation.y = orientation.y();
+    imu_message.orientation.z = orientation.z();
+    imu_message.angular_velocity.x = gyro_x;
+    imu_message.angular_velocity.y = gyro_y;
+    imu_message.angular_velocity.z = gyro_z;
+    imu_message.linear_acceleration.x = accel_x;
+    imu_message.linear_acceleration.y = accel_y;
+    imu_message.linear_acceleration.z = accel_z;
 
-        ImuData.orientation.w = PubSerialData.Qw = Q.w();
-        ImuData.orientation.x = PubSerialData.Qx = Q.x();
-        ImuData.orientation.y = PubSerialData.Qy = Q.y();
-        ImuData.orientation.z = PubSerialData.Qz = Q.z();
+    serial_pub_->publish(serial_message);
+    imu_pub_->publish(imu_message);
+  }
 
-        PubSerialData.Roll = roll + m_rollOffset;
-        PubSerialData.Pitch = pitch + m_pitchOffset;
-        PubSerialData.Yaw = yaw + m_yawOffset;
-
-        ImuData.angular_velocity.x = PubSerialData.AngularVelocity_X = gyro[0];
-        ImuData.angular_velocity.y = PubSerialData.AngularVelocity_Y = gyro[1];
-        ImuData.angular_velocity.z = PubSerialData.AngularVelocity_Z = gyro[2];
-
-        ImuData.linear_acceleration.x = PubSerialData.LinearAcceleration_X = accel[0];
-        ImuData.linear_acceleration.y = PubSerialData.LinearAcceleration_Y = accel[1];
-        ImuData.linear_acceleration.z = PubSerialData.LinearAcceleration_Z = accel[2];
-
-        PubSerialData.Camp = camp;
-        PubSerialData.ShootFlag = shootflag;
-        PubSerialData.BulletVec = bv;
-
-        PubSerialData.header.stamp = ros::Time::now();
-
-        Serial_Rm.publish(PubSerialData);
-        Serial_Imu.publish(ImuData);
-    }
-    //从串口读到的数据
-    void ReceiveSerial()
-    {
-        // Readcom_imu() reports true only after a complete validated IMU frame.
-        if(Sp.Readcom_imu(36))
-        {
-            _RmSerialData = Sp.Rm_Serial_Data;
-        }
-        if(!_RmSerialData.empty()){
-            RmSerialDataInit();
-            PubRmSerialData();
-        }
-        _RmSerialData.clear();
-    }
-
-    //主线
-    void Progress()
-    {
-        //Sp.send_com_test();
-        ReceiveSerial();
-        //cout << angle << endl;
-    }
+  std::unique_ptr<SerialPort> serial_port_;
+  std::string config_path_;
+  std::string shootflag_test_;
+  std::string camp_test_;
+  bool sim_mode_ = false;
+  double roll_offset_ = 0.0;
+  double pitch_offset_ = 0.0;
+  double yaw_offset_ = 0.0;
+  geometry_msgs::msg::Vector3 angle_;
+  rclcpp::Publisher<rm_msgs::msg::RmSerial>::SharedPtr serial_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
+  rclcpp::Subscription<geometry_msgs::msg::Vector3>::SharedPtr angle_sub_;
+  rclcpp::TimerBase::SharedPtr timer_;
 };
+}  // namespace
 
-void runSimulation(ros::NodeHandle& nh, ros::NodeHandle& private_nh)
-{
-    std::string shootflag_test = "a";
-    std::string camp_test = "r";
-    private_nh.param<std::string>("shootflag_test", shootflag_test, "a");
-    private_nh.param<std::string>("camp_test", camp_test, "r");
-
-    const char test_shootflag = !shootflag_test.empty() && shootflag_test[0] == 'f'
-        ? 'f' : 'a';
-    const char test_camp = !camp_test.empty() && camp_test[0] == 'b' ? 'b' : 'r';
-
-    ros::Publisher serial_publisher = nh.advertise<rm_msgs::RmSerial>("/RmSerialData", 1000);
-    ros::Publisher imu_publisher = nh.advertise<sensor_msgs::Imu>("imu/data_raw", 1000);
-    ros::Rate rate(100);
-
-    ROS_WARN("[serial] Simulation mode: ShootFlag=%c", test_shootflag);
-    while (ros::ok()) {
-        const ros::Time stamp = ros::Time::now();
-
-        rm_msgs::RmSerial serial_message;
-        serial_message.header.stamp = stamp;
-        serial_message.Qw = 1.0;
-        serial_message.Qx = 0.0;
-        serial_message.Qy = 0.0;
-        serial_message.Qz = 0.0;
-        serial_message.Camp = test_camp;
-        serial_message.ShootFlag = test_shootflag;
-        serial_message.BulletVec = 21.0;
-
-        sensor_msgs::Imu imu_message;
-        imu_message.header.stamp = stamp;
-        imu_message.header.frame_id = "imu_link";
-        imu_message.orientation.w = 1.0;
-        imu_message.linear_acceleration.z = 9.8;
-
-        serial_publisher.publish(serial_message);
-        imu_publisher.publish(imu_message);
-        ros::spinOnce();
-        rate.sleep();
-    }
-}
-
-int main(int argc, char *argv[])
-{
-    ros::init(argc, argv, "serial");
-    ros::NodeHandle nh;
-    ros::NodeHandle private_nh("~"); // 创建私有节点句柄
-
-    // 从参数服务器获取配置文件路径
-    std::string config_path;
-    private_nh.param<std::string>("armor_serial_config", config_path, "");
-    bool sim_mode = false;
-    private_nh.param<bool>("sim_mode", sim_mode, false);
-    if (sim_mode) {
-        runSimulation(nh, private_nh);
-        return 0;
-    }
-
-    // 查找串口
-    std::cout << "Searching for available serial port..." << std::endl;
-    bool hasAvailable = false;
-    for(int ii = 0;ii < 3;ii++){
-        for(int i = Lower;i < Upper;i++){
-            SPName = SerialPrefix + *(Prefix + ii) + std::to_string(i);
-            std::cout << "Serching " << SPName << " ...                    \r";
-            if(ifstream(SPName.c_str()).good())
-            {
-                std::cout << "Serching " << SPName << " exist!                 \r";
-                hasAvailable = true;
-                break;
-            }
-            std::cout << "Serching " << SPName << " not exist!              \r";
-        }
-        if(hasAvailable)
-            break;
-    }
-    std::cout << std::endl;
-    if(!hasAvailable){
-        ROS_WARN("No available serial port; entering simulation mode");
-        runSimulation(nh, private_nh);
-        return 0;
-    }
-    std::cout << "Have one serial matched:" << SPName << std::endl;
-    RmSerial rs(nh,config_path);
-
-    //订阅方 
-    ros::Subscriber SubYolov8Data = nh.subscribe("/auto_angle",1000,&RmSerial::ReceiveYolov8,&rs);
-    thread th_process([&rs](){
-    while(ros::ok()){
-            ros::spinOnce();
-        }
-    });
-    th_process.detach();
-    while(ros::ok())
-    {
-        rs.Progress();
-    }
-    return 0;
+int main(int argc, char **argv) {
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<RmSerialNode>());
+  rclcpp::shutdown();
+  return 0;
 }

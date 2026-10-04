@@ -95,6 +95,7 @@ public:
     // but does not create large prediction errors for static targets.
     static constexpr double kMinSmallBuffSpeed = 0.052;
     static constexpr double kMaxSmallBuffSpeed = 1.571;
+    static constexpr int kAnchorConfirmFrames = 2;  // 换靶锚点需要连续几帧确认
     static constexpr double kPhaseProcessNoise = 0.005;//
     static constexpr double kPhaseMeasurementNoise = 0.004;
 
@@ -235,6 +236,35 @@ public:
         rejected_count_ = 0;
         ++accepted_count_;
 
+        // ── 换靶锚点检测 ──
+        // 比较识别器报的 raw_angle 和卡尔曼滤波后的连续相位，
+        // 算出差了几片扇叶（72°/片）。连续两帧确认才切换，防止单帧野值误触发。
+        {
+            const double filtered_phase = kalman_.statePost.at<double>(0, 0);
+            // 先折叠到 ±π，再除 72° 取整，避免 raw_angle 过 ±180° 时锚点跳5格
+            const double measurement_delta =
+                std::remainder(raw_angle - filtered_phase, 2.0 * CV_PI);
+            const int candidate_steps =
+                static_cast<int>(std::lround(measurement_delta / kBladePeriod));
+
+            if (candidate_steps != blade_anchor_steps_) {
+                if (candidate_steps == pending_anchor_steps_) {
+                    ++anchor_confirm_count_;
+                    if (anchor_confirm_count_ >= kAnchorConfirmFrames) {
+                        blade_anchor_steps_ = candidate_steps;
+                        anchor_confirm_count_ = 0;
+                        pending_anchor_steps_ = candidate_steps;
+                    }
+                } else {
+                    pending_anchor_steps_ = candidate_steps;
+                    anchor_confirm_count_ = 1;
+                }
+            } else {
+                pending_anchor_steps_ = candidate_steps;
+                anchor_confirm_count_ = 0;
+            }
+        }
+
         // Store phase/timestamp history for omega computation
         phase_history_.push_back(observed_phase);
         time_history_.push_back(timestamp_seconds);
@@ -248,17 +278,20 @@ public:
             double phase_deg = phase_delta * 180.0 / CV_PI;
             double omega_deg = kalman_.statePost.at<double>(1, 0) * 180.0 / CV_PI;
             ROS_INFO_THROTTLE(0.5,
-                "[JITTER-KALMAN] phase=%.2f° omega=%.1f°/s innovation=%.3f° radius=%.1fpx dir=%d accepted=%d",
+                "[JITTER-KALMAN] phase=%.2f° omega=%.1f°/s innovation=%.3f° radius=%.1fpx dir=%d accepted=%d anchor=%d",
                 phase_deg, omega_deg,
                 innovation * 180.0 / CV_PI,
-                radius_, locked_direction_, accepted_count_);
+                radius_, locked_direction_, accepted_count_, blade_anchor_steps_);
         }
 
         // Fast-track: saved direction bypasses converge delay after vision loss.
         if (locked_direction_ == 0) return false;
         if (accepted_count_ < kConvergeDelay && saved_direction_ == 0) return false;
 
-        const double phase = kalman_.statePost.at<double>(0, 0);
+        // 最终输出相位 = 卡尔曼滤波相位 + 锚点偏移（72° × 扇叶片数）
+        // 只加位置偏移，不改速度 omega
+        const double phase = kalman_.statePost.at<double>(0, 0) +
+                             kBladePeriod * blade_anchor_steps_;
         const double omega = kalman_.statePost.at<double>(1, 0);
         const double future_phase = phase + omega * predict_seconds;
         predicted_center = center_ + cv::Point2f(
@@ -280,6 +313,9 @@ public:
 		locked_direction_ = 0;
 		accepted_count_ = 0;
 		rejected_count_ = 0;
+		blade_anchor_steps_ = 0;
+		pending_anchor_steps_ = 0;
+		anchor_confirm_count_ = 0;
 		phase_history_.clear();
 		time_history_.clear();
 		// Pre-seed direction votes from saved direction to speed up re-convergence.
@@ -339,6 +375,9 @@ private:
     int accepted_count_ = 0;
     int rejected_count_ = 0;
 	int saved_direction_ = 0;  // persisted across resets
+    int blade_anchor_steps_ = 0;       // 当前锚定的扇叶偏移（0=同一片，+1=下一片，-1=上一片）
+    int pending_anchor_steps_ = 0;     // 待确认的锚点偏移
+    int anchor_confirm_count_ = 0;     // 连续确认帧数
     cv::KalmanFilter kalman_;
     // Phase/timestamp history for computing angular velocity from observations
     std::deque<double> phase_history_;

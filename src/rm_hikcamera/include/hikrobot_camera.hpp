@@ -1,6 +1,6 @@
 #ifndef CAMERA_HPP
 #define CAMERA_HPP
-#include "ros/ros.h"
+#include <rclcpp/rclcpp.hpp>
 #include <stdio.h>
 #include <pthread.h>
 #include <opencv2/opencv.hpp>
@@ -48,7 +48,7 @@ namespace camera
     {
     public:
         //********** 构造函数  ****************************/
-        Camera(ros::NodeHandle &node);
+        Camera(rclcpp::Node &node);
         //********** 析构函数  ****************************/
         ~Camera();
         //********** 原始信息转换线程 **********************/
@@ -91,28 +91,28 @@ namespace camera
     //^ *********************************************************************************** //
 
     //^ ********************************** Camera constructor************************************ //
-    Camera::Camera(ros::NodeHandle &node)
+    Camera::Camera(rclcpp::Node &node)
     {
         handle = NULL;
 
         //********** 读取待设置的摄像头参数 第三个参数是默认值 yaml文件未给出该值时生效 ********************************/
-        node.param("width", width, 1280);
-        node.param("height", height, 1024);
-        node.param("FrameRateEnable", FrameRateEnable, false);
-        node.param("FrameRate", FrameRate, 88);
-        node.param("BurstFrameCount", BurstFrameCount, 10); // 一次触发采集的次数
-        node.param("ExposureTime", ExposureTime, 8000);
-        node.param("GammaEnable", GammaEnable, true);
-        node.param("Gamma", Gamma, (float)0.8);
-        node.param("GainAuto", GainAuto, 2);
-        node.param("Gain", Gain, (float)0.5);
-        node.param("SaturationEnable", SaturationEnable,true);
-        node.param("Saturation", Saturation, 128);
-        node.param("Offset_x", Offset_x, 0);
-        node.param("Offset_y", Offset_y, 0);
-        node.param("TriggerMode", TriggerMode, 1);
-        node.param("TriggerSource", TriggerSource, 2);
-        node.param("LineSelector", LineSelector, 2);
+        width = node.declare_parameter<int>("width", 1280);
+        height = node.declare_parameter<int>("height", 1024);
+        FrameRateEnable = node.declare_parameter<bool>("FrameRateEnable", false);
+        FrameRate = node.declare_parameter<int>("FrameRate", 88);
+        BurstFrameCount = node.declare_parameter<int>("BurstFrameCount", 10);
+        ExposureTime = node.declare_parameter<int>("ExposureTime", 8000);
+        GammaEnable = node.declare_parameter<bool>("GammaEnable", true);
+        Gamma = node.declare_parameter<float>("Gamma", 0.8F);
+        GainAuto = node.declare_parameter<int>("GainAuto", 2);
+        Gain = node.declare_parameter<float>("Gain", 0.5F);
+        SaturationEnable = node.declare_parameter<bool>("SaturationEnable", true);
+        Saturation = node.declare_parameter<int>("Saturation", 128);
+        Offset_x = node.declare_parameter<int>("Offset_x", 0);
+        Offset_y = node.declare_parameter<int>("Offset_y", 0);
+        TriggerMode = node.declare_parameter<int>("TriggerMode", 1);
+        TriggerSource = node.declare_parameter<int>("TriggerSource", 2);
+        LineSelector = node.declare_parameter<int>("LineSelector", 2);
 
         //********** 枚举设备 ********************************/
         MV_CC_DEVICE_INFO_LIST stDeviceList;
@@ -689,7 +689,7 @@ namespace camera
         MV_CC_PIXEL_CONVERT_PARAM stConvertParam = {0};
         cv::Mat tmp;
         int image_empty_count = 0; //空图帧数
-        while (ros::ok())
+        while (rclcpp::ok())
         {
             start = static_cast<double>(cv::getTickCount());
             nRet = MV_CC_GetOneFrameTimeout(p_handle, m_pBufForDriver, MAX_IMAGE_DATA_SIZE, &stImageInfo, 15);
@@ -697,7 +697,8 @@ namespace camera
             {
                 if (++image_empty_count > 100)
                 {
-                    ROS_INFO("The Number of Faild Reading Exceed The Set Value!\n");
+                    RCLCPP_INFO(rclcpp::get_logger("hikcamera"),
+                                "The Number of Failed Reading Exceed The Set Value!");
                     exit(-1);
                 }
                 continue;
@@ -717,9 +718,9 @@ namespace camera
             stConvertParam.enSrcPixelType = stImageInfo.enPixelType;    //ch:输入像素格式 | en:input pixel format                       //! 输入格式 RGB
             nRet = MV_CC_ConvertPixelType(p_handle, &stConvertParam);
             if (nRet != MV_OK) {
-                ROS_WARN_THROTTLE(1.0,
-                    "[HK_CAMERA] MV_CC_ConvertPixelType failed! nRet [%x] w=%d h=%d",
-                    nRet, stImageInfo.nWidth, stImageInfo.nHeight);
+                RCLCPP_WARN(rclcpp::get_logger("hikcamera"),
+                            "[HK_CAMERA] MV_CC_ConvertPixelType failed! nRet [%x] w=%d h=%d",
+                            nRet, stImageInfo.nWidth, stImageInfo.nHeight);
                 continue;
             }
             pthread_mutex_lock(&mutex);

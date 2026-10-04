@@ -12,7 +12,7 @@
 
 - Keep the current OpenVINO detector and YOLO11 keypoint output unchanged.
 - Do not add TensorRT, CUDA, C++20, or new ROS messages.
-- Use `Fu_angleprocess::angle_` as the continuous roll input and seconds for the new module's timestamps.
+- Use `Fu_angleprocess::angle_polar_now` as the raw polar input; unwrap it inside the adapter and use seconds for timestamps.
 - Preserve the existing legacy predictor and world-frame EKF fallback behavior.
 
 ---
@@ -88,7 +88,7 @@
 - Modify: `src/rm_tracker/config/rm_fu.yaml`
 
 **Interfaces:**
-- Consumes `Angleprocess->angle_` and `time_milliseconds`.
+- Consumes `Angleprocess->angle_polar_now`; uses the image header timestamp in seconds when available and falls back to monotonic runtime milliseconds.
 - Produces the same `final_angle_2D`, `euler_angles`, and `/auto_angle` messages as the existing path.
 
 - [ ] **Step 1: Add a regression test fixture for the integration contract**
@@ -101,7 +101,7 @@
 
 - [ ] **Step 3: Implement the minimal Fu integration**
 
-  Construct one predictor with ROS private parameters using the Zhejiang defaults, reset it with the existing first-frame lifecycle, call `update(time_milliseconds * 0.001, Angleprocess->angle_)` after accepted angle processing, and in the image-phase prediction branch prefer `predict_roll(delta_t_)` only when `ready()` and the returned point is finite. Keep the existing Kalman and legacy predictor code as fallback and leave the world-EKF branch first.
+  Construct one predictor with ROS private parameters using the Zhejiang defaults, reset it with the existing first-frame lifecycle and on serial activation/deactivation edges, call `update_polar(image_timestamp_seconds, Angleprocess->angle_polar_now)` after accepted angle processing, and in the image-phase prediction branch prefer `predict_roll(delta_t_)` only when `ready()` and the returned point is finite. Keep the existing Kalman and legacy predictor code as fallback and leave the world-EKF branch first. Consume each image sequence once, skip isolated speed outliers without clearing RANSAC history, correct five-blade ID switches with `2*pi/5` unwrap aliases, and re-anchor after persistent polar rejections.
 
 - [ ] **Step 4: Build the Fu target and run all existing tracker tests**
 

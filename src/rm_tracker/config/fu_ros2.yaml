@@ -1,0 +1,31 @@
+Fu:
+  ros__parameters:
+    enemy_color: blue
+    buff_big_ransac_enabled: false
+    buff_move_mode: small
+    buff_world_ekf_enabled: false
+    buff_world_ekf_control_enabled: false
+    buff_quaternion_is_imu_to_map: true
+    buff_imu_stamp_offset_seconds: 0.0
+    buff_target_width_mm: 300.0
+    buff_target_height_mm: 300.0
+    buff_camera_matrix: [1725.43995732677, 2.25709283659612, 650.619179581647, 0.0, 1725.73107878698, 502.595484269405, 0.0, 0.0, 1.0]
+    buff_dist_coeffs: [-0.0411501174535933, -0.0281180450824966, 0.000526367183877240, -0.00168702406688350, 1.665885925382968]
+    buff_radius_mm: 650.0
+    buff_hub_normal_offset_mm: 0.0
+    buff_world_center_measurement_std_m: 0.015
+    buff_world_normal_measurement_std_rad: 0.030
+    buff_world_phase_measurement_std_rad: 0.05
+    buff_world_center_process_std_mps: 0.015
+    buff_world_normal_process_std_radps: 0.05
+    buff_world_omega_process_std_radps2: 0.40
+    buff_big_ransac_max_iterations: 200
+    buff_big_ransac_threshold: 0.5
+    buff_big_ransac_min_omega: 1.884
+    buff_big_ransac_max_omega: 2.0
+    buff_big_ransac_min_amplitude: 0.780
+    buff_big_ransac_max_amplitude: 1.045
+    buff_big_ransac_min_inliers: 100
+    buff_big_ransac_max_abs_speed: 3.2
+    buff_big_ransac_max_gap_seconds: 5.0
+    buff_big_ransac_max_consecutive_rejections: 30

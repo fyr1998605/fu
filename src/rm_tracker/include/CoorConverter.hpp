@@ -8,7 +8,7 @@
 #include <iostream>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
-#include <geometry_msgs/TransformStamped.h>
+#include <geometry_msgs/msg/quaternion.hpp>
 
 using namespace cv;
 
@@ -195,7 +195,7 @@ public:
     Eigen::Vector4d Euler2QUaternion(double roll, double pitch, double yaw);
 
     // 四元数 -> 欧拉角
-    Eigen::Vector3d QUaternion2Euler(const geometry_msgs::Quaternion& qtn);
+    Eigen::Vector3d QUaternion2Euler(const geometry_msgs::msg::Quaternion& qtn);
 
     // Eigen向量 -> Point点
     cv::Point3d Vector2Point(Eigen::Vector3d src);

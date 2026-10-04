@@ -6,11 +6,10 @@
 #include <stdexcept>
 #include "math.hpp"
 #include <fstream>
-#include <ros/ros.h>
+#include "ros2_compat.hpp"
 #include <yaml-cpp/yaml.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
-#include <geometry_msgs/TransformStamped.h>
 #include "CoorConverter.hpp"
 
 using namespace std;
@@ -520,7 +519,7 @@ Eigen::Vector4d CoordinateTransformer::Euler2QUaternion(double roll, double pitc
 }
 
 // 四元数转欧拉角
-Eigen::Vector3d CoordinateTransformer::QUaternion2Euler(const geometry_msgs::Quaternion& qtn) {
+Eigen::Vector3d CoordinateTransformer::QUaternion2Euler(const geometry_msgs::msg::Quaternion& qtn) {
     tf2::Quaternion quaternion(qtn.x,qtn.y,qtn.z,qtn.w);
     tf2::Matrix3x3 matrix(quaternion);
     double roll, pitch, yaw;

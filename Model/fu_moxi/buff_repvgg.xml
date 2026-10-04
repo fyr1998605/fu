@@ -1,4 +1,4 @@
-<?xml version="1.0"?>
+<?xml version='1.0' encoding='utf-8'?>
 <net name="main_graph" version="11">
 	<layers>
 		<layer id="0" name="images" type="Parameter" version="opset1">
@@ -862,7 +862,7 @@
 				</port>
 			</output>
 		</layer>
-		<layer id="47" name="/model.6/Resize" type="Interpolate" version="opset11">
+		<layer id="47" name="/model.6/Resize" type="Interpolate" version="opset9">
 			<data mode="nearest" shape_calculation_mode="scales" coordinate_transformation_mode="asymmetric" nearest_mode="floor" antialias="false" pads_begin="0, 0, 0, 0" pads_end="0, 0, 0, 0" cube_coeff="-0.75" />
 			<input>
 				<port id="0" precision="FP32">
@@ -871,12 +871,12 @@
 					<dim>20</dim>
 					<dim>20</dim>
 				</port>
-				<port id="1" precision="FP32">
+				<port id="1" precision="I64"><dim>4</dim></port><port id="2" precision="FP32">
 					<dim>4</dim>
 				</port>
-			</input>
+			<port id="3" precision="I64"><dim>4</dim></port></input>
 			<output>
-				<port id="2" precision="FP32" names="/model.6/Resize_output_0">
+				<port id="4" precision="FP32" names="/model.6/Resize_output_0">
 					<dim>1</dim>
 					<dim>96</dim>
 					<dim>40</dim>
@@ -1342,7 +1342,7 @@
 				</port>
 			</output>
 		</layer>
-		<layer id="73" name="/model.9/Resize" type="Interpolate" version="opset11">
+		<layer id="73" name="/model.9/Resize" type="Interpolate" version="opset9">
 			<data mode="nearest" shape_calculation_mode="scales" coordinate_transformation_mode="asymmetric" nearest_mode="floor" antialias="false" pads_begin="0, 0, 0, 0" pads_end="0, 0, 0, 0" cube_coeff="-0.75" />
 			<input>
 				<port id="0" precision="FP32">
@@ -1351,12 +1351,12 @@
 					<dim>40</dim>
 					<dim>40</dim>
 				</port>
-				<port id="1" precision="FP32">
+				<port id="1" precision="I64"><dim>4</dim></port><port id="2" precision="FP32">
 					<dim>4</dim>
 				</port>
-			</input>
+			<port id="3" precision="I64"><dim>4</dim></port></input>
 			<output>
-				<port id="2" precision="FP32" names="/model.9/Resize_output_0">
+				<port id="4" precision="FP32" names="/model.9/Resize_output_0">
 					<dim>1</dim>
 					<dim>48</dim>
 					<dim>80</dim>
@@ -6231,7 +6231,7 @@
 				</port>
 			</output>
 		</layer>
-		<layer id="344" name="output0/sink_port_0" type="Result" version="opset1">
+		<layer id="345" name="Resize_47_target_shape" type="Const" version="opset1"><data element_type="i64" offset="2502400" shape="4" size="32" /><output><port id="0" precision="I64"><dim>4</dim></port></output></layer><layer id="346" name="Resize_73_target_shape" type="Const" version="opset1"><data element_type="i64" offset="2502432" shape="4" size="32" /><output><port id="0" precision="I64"><dim>4</dim></port></output></layer><layer id="347" name="Resize_axes" type="Const" version="opset1"><data element_type="i64" offset="2502464" shape="4" size="32" /><output><port id="0" precision="I64"><dim>4</dim></port></output></layer><layer id="344" name="output0/sink_port_0" type="Result" version="opset1">
 			<input>
 				<port id="0" precision="FP32">
 					<dim>1</dim>
@@ -6294,9 +6294,9 @@
 		<edge from-layer="44" from-port="2" to-layer="45" to-port="0" />
 		<edge from-layer="45" from-port="1" to-layer="47" to-port="0" />
 		<edge from-layer="45" from-port="1" to-layer="195" to-port="1" />
-		<edge from-layer="46" from-port="0" to-layer="47" to-port="1" />
-		<edge from-layer="46" from-port="0" to-layer="73" to-port="1" />
-		<edge from-layer="47" from-port="2" to-layer="48" to-port="0" />
+		<edge from-layer="46" from-port="0" to-layer="47" to-port="2" />
+		<edge from-layer="46" from-port="0" to-layer="73" to-port="2" />
+		<edge from-layer="47" from-port="4" to-layer="48" to-port="0" />
 		<edge from-layer="48" from-port="2" to-layer="50" to-port="0" />
 		<edge from-layer="49" from-port="0" to-layer="50" to-port="1" />
 		<edge from-layer="50" from-port="2" to-layer="52" to-port="0" />
@@ -6325,7 +6325,7 @@
 		<edge from-layer="71" from-port="2" to-layer="72" to-port="0" />
 		<edge from-layer="72" from-port="1" to-layer="135" to-port="1" />
 		<edge from-layer="72" from-port="1" to-layer="73" to-port="0" />
-		<edge from-layer="73" from-port="2" to-layer="74" to-port="0" />
+		<edge from-layer="73" from-port="4" to-layer="74" to-port="0" />
 		<edge from-layer="74" from-port="2" to-layer="76" to-port="0" />
 		<edge from-layer="75" from-port="0" to-layer="76" to-port="1" />
 		<edge from-layer="76" from-port="2" to-layer="78" to-port="0" />
@@ -6629,7 +6629,7 @@
 		<edge from-layer="341" from-port="2" to-layer="342" to-port="0" />
 		<edge from-layer="342" from-port="2" to-layer="343" to-port="2" />
 		<edge from-layer="343" from-port="3" to-layer="344" to-port="0" />
-	</edges>
+	<edge from-layer="345" from-port="0" to-layer="47" to-port="1" /><edge from-layer="346" from-port="0" to-layer="73" to-port="1" /><edge from-layer="347" from-port="0" to-layer="47" to-port="3" /><edge from-layer="347" from-port="0" to-layer="73" to-port="3" /></edges>
 	<rt_info>
 		<Runtime_version value="2024.6.0-17404-4c0f47d2335-releases/2024/6" />
 		<conversion_parameters>

@@ -7,6 +7,7 @@
 #include<boost/asio.hpp>
 #include<boost/bind.hpp>
 #include <chrono>
+#include <rclcpp/rclcpp.hpp>
 using namespace std;
 using namespace boost::asio;
 
@@ -412,8 +413,9 @@ bool SerialPort::Readcom_imu(int data_len)
 	// cout << endl << data_temp.size()<<"-----------------------------------------" << data_temp.size() << endl;
 	// data_temp.clear();
 	if(ec) {
-		ROS_ERROR("串口断开,主动结束节点以触发串口重启机制");
-		ros::shutdown();	 // 优雅关闭ROS
+		RCLCPP_ERROR(rclcpp::get_logger("rm_serial"),
+		             "串口断开,主动结束节点以触发串口重启机制");
+		rclcpp::shutdown();	 // 优雅关闭ROS2
 		exit(EXIT_FAILURE);  // 强制自杀,打破死循环
 		return false;
 	}

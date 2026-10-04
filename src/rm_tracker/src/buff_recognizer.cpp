@@ -1,5 +1,5 @@
 #include "buff_recognizer.hpp"
-#include <ros/ros.h>
+#include "ros2_compat.hpp"
 #include <algorithm>
 #include <cmath>
 #include <random>

@@ -24,12 +24,28 @@ buff_dist_coeffs: [-0.0411501174535933, -0.0281180450824966, 0.00052636718387724
 # ============================================================
 
 # -------------------- 开关 & 物理参数 --------------------
-buff_world_ekf_enabled: true                  # [开关] 是否启用 EKF, false 则直接用 PnP 原始值
-buff_world_ekf_control_enabled:  true         # [开关] EKF 控制输入(云台反馈)是否启用
+buff_world_ekf_enabled: false                  # [开关] 是否启用 EKF, false 则直接用 PnP 原始值
+buff_world_ekf_control_enabled:  false         # [开关] EKF 控制输入(云台反馈)是否启用
 buff_quaternion_is_imu_to_map: true           # [方向] 四元数旋转方向, 一般不改
 buff_imu_stamp_offset_seconds: 0.0            # [同步] IMU 时间戳偏移(秒), IMU比相机快时填正值
 buff_radius_mm: 650.00                        # [尺寸] 能量机关半径(mm), 中心→装甲板距离
 buff_hub_normal_offset_mm: 0.0                # [尺寸] 中心hub法向偏移(mm), 一般=0
+
+# Zhejiang University large-buff sine-model adapter. The existing predictor
+# remains the fallback until this model reaches min_inliers.
+# Select the target explicitly; the default keeps the existing small-buff path.
+buff_move_mode: small
+buff_big_ransac_enabled: false
+buff_big_ransac_max_iterations: 200
+buff_big_ransac_threshold: 0.5
+buff_big_ransac_min_omega: 1.884
+buff_big_ransac_max_omega: 2.0
+buff_big_ransac_min_amplitude: 0.780
+buff_big_ransac_max_amplitude: 1.045
+buff_big_ransac_min_inliers: 100
+buff_big_ransac_max_abs_speed: 3.2
+buff_big_ransac_max_gap_seconds: 5.0
+buff_big_ransac_max_consecutive_rejections: 30
 
 # ============================================================
 #  观测噪声 R (Measurement Noise) —— "PnP 测量值有多不准?"

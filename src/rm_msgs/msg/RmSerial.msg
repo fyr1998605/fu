@@ -1,24 +1,24 @@
-float64 Roll
-float64 Pitch
-float64 Yaw
+float64 roll
+float64 pitch
+float64 yaw
 
-float64 Qw
-float64 Qx
-float64 Qy
-float64 Qz
+float64 qw
+float64 qx
+float64 qy
+float64 qz
 
-float64 AngularVelocity_X
-float64 AngularVelocity_Y
-float64 AngularVelocity_Z
+float64 angular_velocity_x
+float64 angular_velocity_y
+float64 angular_velocity_z
 
-float64 LinearAcceleration_X
-float64 LinearAcceleration_Y
-float64 LinearAcceleration_Z
-float64 BulletVec
-int8 Camp
-int8 ShootFlag
+float64 linear_acceleration_x
+float64 linear_acceleration_y
+float64 linear_acceleration_z
+float64 bullet_vec
+int8 camp
+int8 shoot_flag
 
-int8 iS_auto_fire
+int8 is_auto_fire
 int8 post_alive
 std_msgs/Header header
 # struct timespec serial_ts
