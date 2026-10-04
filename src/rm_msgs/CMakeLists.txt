@@ -1,34 +1,18 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.8)
 project(rm_msgs)
 
-set(CMAKE_CXX_STANDARD 14)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-add_compile_options(-std=c++14)
+find_package(ament_cmake REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+find_package(std_msgs REQUIRED)
 
-find_package(catkin REQUIRED COMPONENTS
-  std_msgs
-  geometry_msgs
-  message_generation
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/Armor.msg"
+  "msg/ArmorArray.msg"
+  "msg/Debug.msg"
+  "msg/RmSerial.msg"
+  DEPENDENCIES geometry_msgs std_msgs
 )
 
-add_message_files(
-  FILES
-  Armor.msg
-  ArmorArray.msg
-  Debug.msg
-  RmSerial.msg
-)
-
-generate_messages(
-  DEPENDENCIES
-  std_msgs
-  geometry_msgs
-)
-
-catkin_package(
-  CATKIN_DEPENDS std_msgs geometry_msgs message_runtime
-)
-
-include_directories(${catkin_INCLUDE_DIRS})
-
-SET(CMAKE_BUILD_TYPE "RelWithDebInfo")
+ament_export_dependencies(rosidl_default_runtime geometry_msgs std_msgs)
+ament_package()

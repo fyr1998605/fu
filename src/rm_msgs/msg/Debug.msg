@@ -17,4 +17,4 @@ float64 yV
 float64 zV
 float64[] yaws
 
-char Rebuild
+int8 Rebuild

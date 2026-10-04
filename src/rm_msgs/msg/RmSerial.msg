@@ -15,11 +15,11 @@ float64 LinearAcceleration_X
 float64 LinearAcceleration_Y
 float64 LinearAcceleration_Z
 float64 BulletVec
-char Camp
-char ShootFlag
+int8 Camp
+int8 ShootFlag
 
-char iS_auto_fire
-char post_alive
+int8 iS_auto_fire
+int8 post_alive
 std_msgs/Header header
 # struct timespec serial_ts
 # char Islife
