@@ -9,3 +9,4 @@ log/
 .marscode/
 *.swp
 *~
+__pycache__/
