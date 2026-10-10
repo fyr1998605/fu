@@ -36,14 +36,13 @@ find_package(catkin REQUIRED COMPONENTS
   rm_msgs
 )
 
-# 如果你的 Eigen3 确实安装在 /usr/local/eigen-3.4，可保留；否则可注释掉让 CMake 自动找
-set(Eigen3_DIR "/usr/local/eigen-3.4/share/eigen3/cmake")
+# ========== 修改点1：删除强制指定 Eigen3_DIR 的语句，让系统自动查找 ==========
+# set(Eigen3_DIR "/usr/local/eigen-3.4/share/eigen3/cmake")   # 已注释掉
 
 catkin_package(
   INCLUDE_DIRS include
   CATKIN_DEPENDS roscpp std_msgs tf2_ros tf2 cv_bridge image_transport sensor_msgs geometry_msgs rm_msgs
   DEPENDS OpenCV Eigen3 Ceres yaml-cpp Protobuf
-  # 注意：这里不能再写 rm_msgs，已经在 CATKIN_DEPENDS 中声明了
 )
 
 # OpenVINO 2024.4 自带 TBB 库路径（编译+运行都需找到 libtbb.so.12）
@@ -55,12 +54,12 @@ set(OPENVINO_LIB_DIR /opt/l_openvino_toolkit_ubuntu20_2024.4.0.16579.c3152d32c9c
 link_directories(${OPENVINO_LIB_DIR})
 set(CMAKE_BUILD_RPATH "${OPENVINO_TBB_DIR};${OPENVINO_LIB_DIR}")
 
-# 全局头文件目录
+# ========== 修改点2：在全局头文件目录中，将 ${Eigen3_INCLUDE_DIRS} 改为 /usr/include/eigen3 ==========
 include_directories(
   include
   ${catkin_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
-  ${Eigen3_INCLUDE_DIRS}
+  /usr/include/eigen3               # 直接指定 Eigen 头文件路径
   ${CERES_INCLUDE_DIRS}
   ${yaml-cpp_INCLUDE_DIRS}
   ${Protobuf_INCLUDE_DIRS}
@@ -104,6 +103,9 @@ target_link_libraries(tracker
 add_executable(Fu
   src/Fu.cpp
   src/buff_recognizer.cpp
+  src/buff_zju_ransac.cpp
+  src/buff_big_ransac_predictor.cpp
+  src/buff_big_variable_speed_predictor.cpp
   include/CoorConverter.cpp
 )
 add_dependencies(Fu
@@ -164,6 +166,77 @@ if(CATKIN_ENABLE_TESTING)
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
   add_test(NAME buff_prediction_geometry_test COMMAND buff_prediction_geometry_test)
+
+  add_executable(buff_zju_ransac_test
+    test/buff_zju_ransac_test.cpp
+    src/buff_zju_ransac.cpp
+  )
+  target_include_directories(buff_zju_ransac_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(buff_zju_ransac_test
+    ${catkin_LIBRARIES}
+    ${OpenCV_LIBS}
+  )
+  add_test(NAME buff_zju_ransac_test COMMAND buff_zju_ransac_test)
+
+  add_executable(buff_big_ransac_predictor_test
+    test/buff_big_ransac_predictor_test.cpp
+    src/buff_big_ransac_predictor.cpp
+    src/buff_zju_ransac.cpp
+  )
+  target_include_directories(buff_big_ransac_predictor_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(buff_big_ransac_predictor_test
+    ${catkin_LIBRARIES}
+    ${OpenCV_LIBS}
+  )
+  add_test(NAME buff_big_ransac_predictor_test COMMAND buff_big_ransac_predictor_test)
+
+  add_executable(buff_big_variable_speed_predictor_test
+    test/buff_big_variable_speed_predictor_test.cpp
+    src/buff_big_variable_speed_predictor.cpp
+  )
+  target_include_directories(buff_big_variable_speed_predictor_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  add_test(NAME buff_big_variable_speed_predictor_test
+    COMMAND buff_big_variable_speed_predictor_test)
+
+  add_executable(buff_big_prediction_gate_test
+    test/buff_big_prediction_gate_test.cpp
+  )
+  target_include_directories(buff_big_prediction_gate_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  add_test(NAME buff_big_prediction_gate_test COMMAND buff_big_prediction_gate_test)
+
+  add_executable(buff_angle_processor_test
+    test/buff_angle_processor_test.cpp
+  )
+  target_include_directories(buff_angle_processor_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(buff_angle_processor_test
+    ${catkin_LIBRARIES}
+    ${OpenCV_LIBS}
+  )
+  add_test(NAME buff_angle_processor_test COMMAND buff_angle_processor_test)
+
+  # 靶子切换 (five-blade ID switch) regression: the predicted point must follow
+  # the blade the detector reports. Uses rosconsole, hence catkin_LIBRARIES.
+  add_executable(buff_blade_tracker_test
+    test/buff_blade_tracker_test.cpp
+  )
+  target_include_directories(buff_blade_tracker_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(buff_blade_tracker_test
+    ${catkin_LIBRARIES}
+    ${OpenCV_LIBS}
+  )
+  add_test(NAME buff_blade_tracker_test COMMAND buff_blade_tracker_test)
 endif()
 
 # 安装规则

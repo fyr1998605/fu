@@ -1,6 +1,7 @@
 #include "buff_recognizer.hpp"
 #include <ros/ros.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <random>
 
@@ -262,6 +263,15 @@ BuffRecognizer::BuffRecognizer(const std::string& model_path,
              model_path.c_str(), enemy_color.c_str());
 }
 
+void BuffRecognizer::setTargetPriority(
+    const std::string& priority, const double lock_timeout_seconds) {
+    target_priority_locked_ = priority != "confidence";
+    target_lock_.setTimeoutSeconds(lock_timeout_seconds);
+    ROS_INFO("[BuffRecognizer] 目标优先级: %s, 锁定超时: %.3fs",
+             target_priority_locked_ ? "locked" : "confidence",
+             std::max(0.01, lock_timeout_seconds));
+}
+
 // ====== 图像预处理: 灰度→二值化→膨胀 ======
 // 用于 refineRCenter 中提取装甲板白色区域
 void BuffRecognizer::handleImage(const cv::Mat& bgr_img, cv::Mat& dilated_img) {
@@ -338,7 +348,8 @@ cv::Point2f BuffRecognizer::refineRCenter(const cv::Mat& bgr_img,
 }
 
 int BuffRecognizer::selectTemporalDetection(
-    const std::vector<BuffDetection>& detections) const {
+    const std::vector<BuffDetection>& detections,
+    const double timestamp_seconds) const {
     std::vector<BuffTemporalCandidate> candidates;
     candidates.reserve(detections.size());
     for (const BuffDetection& detection : detections) {
@@ -383,8 +394,21 @@ int BuffRecognizer::selectTemporalDetection(
         }
     }
 
-    const int index = BuffDetectionStabilizer::selectCandidate(
-        candidates, compensated_prev_fan, has_prev_, association_gate_px);
+    if (target_priority_locked_ && target_lock_.locked() && has_prev_) {
+        association_gate_px = std::min(
+            association_gate_px,
+            BuffDetectionStabilizer::lockedAssociationGateForRadius(
+                static_cast<float>(last_track_radius_)));
+    }
+
+    const int index = target_priority_locked_
+        ? target_lock_.select(
+              candidates, association_gate_px,
+              timestamp_seconds,
+              {compensated_prev_fan.x - last_Fan_center_.x,
+               compensated_prev_fan.y - last_Fan_center_.y})
+        : BuffDetectionStabilizer::selectCandidate(
+              candidates, compensated_prev_fan, has_prev_, association_gate_px);
     return index;
 }
 
@@ -410,6 +434,18 @@ void BuffRecognizer::resetTemporalState() {
     jump_reject_cnt_ = 0;
     last_track_radius_ = 0.0;
     last_corners_.clear();
+    target_lock_.reset();
+}
+
+void BuffRecognizer::noteTrackingLoss(const double timestamp_seconds) {
+    if (target_priority_locked_ && target_lock_.locked() &&
+        target_lock_.noteMiss(timestamp_seconds)) {
+        // Keep the last accepted geometry and lock through a short detector
+        // dropout. The next multi-box result is still associated to this lock.
+        stabilizer_.clearPendingJump();
+        return;
+    }
+    resetTemporalState();
 }
 
 // ====== 首帧初始化 ======
@@ -458,6 +494,9 @@ bool BuffRecognizer::init(const cv::Mat& frame,
         {stabilized.corners[3].x, stabilized.corners[3].y}};
     last_R_box_      = results[0].rect;
     has_prev_        = true;
+    const double now_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    target_lock_.lock({out_Fan_center.x, out_Fan_center.y}, now_seconds);
 
     ROS_INFO("[BuffRecognizer] 首帧初始化成功: R(%d,%d) Fan(%d,%d) side=%.1f",
              (int)out_R_center.x, (int)out_R_center.y,
@@ -477,6 +516,8 @@ bool BuffRecognizer::identify(const cv::Mat& frame,
         ROS_WARN("[BuffRecognizer] identify: 输入图像为空");
         return false;
     }
+    const double now_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 
     // ═══ Step 1-2: YOLO 推理 → 9原始关键点 → remap → 6标准关键点 ═══
     int64 t_yolo_start = cv::getTickCount();
@@ -485,19 +526,19 @@ bool BuffRecognizer::identify(const cv::Mat& frame,
     int64 t_yolo_end = cv::getTickCount();
     if (results.empty()) {
         consecutive_fail_++;
-        resetTemporalState();
+        noteTrackingLoss(now_seconds);
         ROS_DEBUG("[BuffRecognizer] 未检测到目标 (连续失败:%d)", consecutive_fail_);
         return false;
     }
     consecutive_fail_ = 0;
 
-    const int selected_idx = selectTemporalDetection(results);
+    const int selected_idx = selectTemporalDetection(results, now_seconds);
     if (selected_idx < 0) {
         // Association failed: no candidate within the spatial gate.
         // Enter reacquisition instead of silently picking a distant
         // high-confidence candidate (see Section 4.3 of the bug-fix document).
         consecutive_fail_++;
-        resetTemporalState();
+        noteTrackingLoss(now_seconds);
         ROS_WARN_THROTTLE(0.5,
             "[BuffRecognizer] 时序关联失败: 无候选在关联门限内 (candidates=%zu)", results.size());
         return false;
@@ -539,6 +580,20 @@ bool BuffRecognizer::identify(const cv::Mat& frame,
         float dist_fan = cv::norm(raw_fan_center - last_Fan_center_);
         float dist_r   = cv::norm(raw_r_center   - last_R_center_);
         if (dist_fan > radius * 0.55f || dist_r > radius * 0.35f) {
+            if (target_priority_locked_ &&
+                !target_lock_.canAcceptGenericJump(now_seconds)) {
+                stabilizer_.clearPendingJump();
+                out_R_center = last_R_center_;
+                out_Fan_center = last_Fan_center_;
+                out_side = last_side_;
+                out_corners = last_corners_;
+                noteTrackingLoss(now_seconds);
+                ROS_WARN_THROTTLE(
+                    0.5,
+                    "[BuffRecognizer] 锁定目标拒绝跨扇叶跳变: fan=%.1f r=%.1f",
+                    dist_fan, dist_r);
+                return false;
+            }
             const float association_gate_px =
                 BuffDetectionStabilizer::associationGateForRadius(
                     static_cast<float>(std::max(radius, last_track_radius_)));
@@ -616,6 +671,9 @@ bool BuffRecognizer::identify(const cv::Mat& frame,
         last_R_box_ = selected.rect;
     }
     has_prev_        = true;
+    if (target_priority_locked_) {
+        target_lock_.accept({out_Fan_center.x, out_Fan_center.y}, now_seconds);
+    }
 
     // 延迟统计 (1秒打印一次, 避免刷屏)
     double t_freq = cv::getTickFrequency();

@@ -18,6 +18,127 @@ struct BuffTemporalCandidate {
     float confidence = 0.0f;
 };
 
+// Identity lock for scenes where two rune blades are visible at once. The
+// lock follows the previously accepted target with a one-step pixel velocity;
+// it only falls back to confidence-based acquisition after the target has
+// been absent for the configured monotonic-time interval.
+class BuffTargetLock {
+public:
+    explicit BuffTargetLock(const double timeout_seconds = 0.25)
+        : timeout_seconds_(std::isfinite(timeout_seconds)
+                               ? std::max(0.01, timeout_seconds) : 0.25) {}
+
+    void setTimeoutSeconds(const double timeout_seconds) {
+        timeout_seconds_ = std::isfinite(timeout_seconds)
+            ? std::max(0.01, timeout_seconds) : 0.25;
+    }
+
+    void reset() {
+        locked_ = false;
+        first_miss_timestamp_ = std::numeric_limits<double>::quiet_NaN();
+        last_accept_timestamp_ = 0.0;
+        center_ = {};
+        velocity_ = {};
+    }
+
+    void lock(const BuffPoint& center, const double timestamp_seconds) {
+        locked_ = true;
+        first_miss_timestamp_ = std::numeric_limits<double>::quiet_NaN();
+        last_accept_timestamp_ = timestamp_seconds;
+        center_ = center;
+        velocity_ = {};
+    }
+
+    void accept(const BuffPoint& center, const double timestamp_seconds) {
+        if (isExpired(timestamp_seconds)) {
+            lock(center, timestamp_seconds);
+            return;
+        }
+        if (!locked_) {
+            lock(center, timestamp_seconds);
+            return;
+        }
+        const double interval = std::max(0.001, timestamp_seconds - last_accept_timestamp_);
+        velocity_ = {
+            (center.x - center_.x) / static_cast<float>(interval),
+            (center.y - center_.y) / static_cast<float>(interval)};
+        center_ = center;
+        last_accept_timestamp_ = timestamp_seconds;
+        first_miss_timestamp_ = std::numeric_limits<double>::quiet_NaN();
+    }
+
+    bool noteMiss(const double timestamp_seconds) {
+        if (!locked_) return false;
+        if (!std::isfinite(first_miss_timestamp_)) {
+            first_miss_timestamp_ = timestamp_seconds;
+        }
+        return !isExpired(timestamp_seconds);
+    }
+
+    int select(const std::vector<BuffTemporalCandidate>& candidates,
+               const float association_gate_px,
+               const double timestamp_seconds,
+               const BuffPoint& reference_offset = {}) const {
+        if (candidates.empty()) return -1;
+        if (!locked_ || isExpired(timestamp_seconds)) {
+            return highestConfidence(candidates);
+        }
+
+        const float elapsed_seconds = static_cast<float>(
+            std::max(0.0, timestamp_seconds - last_accept_timestamp_));
+        const BuffPoint reference{
+            center_.x + velocity_.x * elapsed_seconds +
+                reference_offset.x,
+            center_.y + velocity_.y * elapsed_seconds +
+                reference_offset.y};
+        const float gate_squared = association_gate_px * association_gate_px;
+        int nearest_index = -1;
+        float nearest_distance_squared =
+            std::numeric_limits<float>::infinity();
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            const float dx = candidates[i].fan_center.x - reference.x;
+            const float dy = candidates[i].fan_center.y - reference.y;
+            const float distance_squared = dx * dx + dy * dy;
+            if (distance_squared <= gate_squared &&
+                distance_squared < nearest_distance_squared) {
+                nearest_distance_squared = distance_squared;
+                nearest_index = static_cast<int>(i);
+            }
+        }
+        return nearest_index;
+    }
+
+    bool locked() const { return locked_; }
+    bool canAcceptGenericJump(const double timestamp_seconds) const {
+        return !locked_ || isExpired(timestamp_seconds);
+    }
+
+private:
+    bool isExpired(const double timestamp_seconds) const {
+        return locked_ && std::isfinite(first_miss_timestamp_) &&
+            std::isfinite(timestamp_seconds) &&
+            timestamp_seconds - first_miss_timestamp_ >= timeout_seconds_;
+    }
+
+    static int highestConfidence(
+        const std::vector<BuffTemporalCandidate>& candidates) {
+        int best = 0;
+        for (std::size_t i = 1; i < candidates.size(); ++i) {
+            if (candidates[i].confidence > candidates[best].confidence) {
+                best = static_cast<int>(i);
+            }
+        }
+        return best;
+    }
+
+    double timeout_seconds_ = 0.25;
+    double first_miss_timestamp_ = std::numeric_limits<double>::quiet_NaN();
+    double last_accept_timestamp_ = 0.0;
+    bool locked_ = false;
+    BuffPoint center_;
+    BuffPoint velocity_;
+};
+
 struct BuffStabilizedGeometry {
     BuffPoint r_center;
     BuffPoint fan_center;
@@ -75,6 +196,15 @@ public:
         // association failure → reacquisition stall → World EKF starved
         // of observations after every power-rune light on.
         return std::max(20.0f, radius_px * 1.2f);
+    }
+
+    static float lockedAssociationGateForRadius(float radius_px) {
+        // Once a blade is locked, do not reuse the wide reacquisition gate:
+        // the adjacent simultaneously-lit blade is about 1.18×radius away
+        // and would otherwise be accepted after a one-frame detector miss.
+        // Keep enough margin for one frame of compensated gimbal motion while
+        // staying well below the adjacent-blade separation.
+        return std::max(20.0f, radius_px * 0.75f);
     }
 
     // Confirm a persistent jump only after three consecutive consistent frames

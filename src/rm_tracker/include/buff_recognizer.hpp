@@ -110,6 +110,11 @@ public:
     BuffRecognizer(const std::string& model_path,
                    const std::string& enemy_color = "blue");
 
+    // "locked" keeps the first successfully associated blade while it is
+    // temporarily missing; "confidence" retains the legacy re-acquisition.
+    void setTargetPriority(const std::string& priority,
+                           double lock_timeout_seconds = 0.25);
+
     // ========== 首帧初始化 ==========
     /// YOLO推理 → remap → R中心精化 → 输出 R中心/扇叶中心/边长, 保存状态
     bool init(const cv::Mat& frame,
@@ -173,7 +178,8 @@ private:
                                const std::vector<cv::Point2f>& kpts);
 
     int selectTemporalDetection(
-        const std::vector<BuffDetection>& detections) const;
+        const std::vector<BuffDetection>& detections,
+        double timestamp_seconds) const;
 
     BuffStabilizedGeometry stabilizeDetection(
         const cv::Point2f& raw_r_center,
@@ -181,6 +187,7 @@ private:
         const std::vector<cv::Point2f>& raw_corners);
 
     void resetTemporalState();
+    void noteTrackingLoss(double timestamp_seconds);
 
     /// BGR→灰度→二值化→膨胀, 用于提取装甲板白色区域
     void handleImage(const cv::Mat& bgr_img, cv::Mat& dilated_img);
@@ -188,6 +195,8 @@ private:
     // ========== 成员变量 ==========
     YoloBuffDetector detector_;
     BuffDetectionStabilizer stabilizer_;
+    BuffTargetLock target_lock_;
+    bool target_priority_locked_ = true;
 
     // 识别结果缓存 (最近一帧)
     cv::Point2f last_R_center_   = {0, 0};

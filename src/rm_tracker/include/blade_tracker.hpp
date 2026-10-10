@@ -97,6 +97,8 @@ public:
     static constexpr double kMaxSmallBuffSpeed = 1.571;
     static constexpr double kPhaseProcessNoise = 0.005;//
     static constexpr double kPhaseMeasurementNoise = 0.004;
+    // Frames confirming a new blade before the aim point is re-anchored.
+    static constexpr int kAnchorConfirmFrames = 2;
 
     bool update(const cv::Point2f& r_center,
                 const cv::Point2f& blade_center,
@@ -119,6 +121,7 @@ public:
             radius_ = measured_radius;
             center_ = r_center;
             initializeKalman(raw_angle);
+            resetBladeAnchor();  // state phase == raw_angle at init
             return false;
         }
 
@@ -152,6 +155,7 @@ public:
                 last_observed_phase_ = raw_angle;
                 center_ = r_center;
                 radius_ = measured_radius;
+                resetBladeAnchor();  // state phase re-initialized to raw_angle
                 return false;
             }
             reset();
@@ -243,22 +247,67 @@ public:
             time_history_.pop_front();
         }
 
-        // ── 抖动诊断: Kalman内部状态 ──
+        // ── 抖动诊断: Kalman内部状态 (anchor = 当前锁定的扇叶相对相位的整格偏移) ──
         {
             double phase_deg = phase_delta * 180.0 / CV_PI;
             double omega_deg = kalman_.statePost.at<double>(1, 0) * 180.0 / CV_PI;
             ROS_INFO_THROTTLE(0.5,
-                "[JITTER-KALMAN] phase=%.2f° omega=%.1f°/s innovation=%.3f° radius=%.1fpx dir=%d accepted=%d",
+                "[JITTER-KALMAN] phase=%.2f° omega=%.1f°/s innovation=%.3f° radius=%.1fpx dir=%d accepted=%d anchor=%.1f°",
                 phase_deg, omega_deg,
                 innovation * 180.0 / CV_PI,
-                radius_, locked_direction_, accepted_count_);
+                radius_, locked_direction_, accepted_count_,
+                bladeAnchorRadians() * 180.0 / CV_PI);
         }
 
         // Fast-track: saved direction bypasses converge delay after vision loss.
         if (locked_direction_ == 0) return false;
         if (accepted_count_ < kConvergeDelay && saved_direction_ == 0) return false;
 
-        const double phase = kalman_.statePost.at<double>(0, 0);
+        // ── Position re-anchor (blade identity) ──
+        // The phase filter above is deliberately blade-invariant: every
+        // measurement is folded by 2*pi/5 so that a five-blade ID switch (the
+        // "打中后切换靶子" jump) is not mistaken for a 72-degree velocity
+        // spike. The cost is that statePost[0] is only meaningful *modulo* one
+        // blade period, so anchoring the aim point on it leaves the prediction
+        // on whichever blade the tracker first locked onto — after each hit it
+        // falls one more blade behind the lit target (0, -72, -144 deg ...),
+        // which is the "预测点反转" seen on the field.
+        // The predicted point must sit on the blade the detector is actually
+        // reporting, so add the multiple of 2*pi/5 that maps the filtered phase
+        // onto this frame's measurement. Only the position changes — the
+        // velocity model, direction votes and rejection logic stay
+        // blade-invariant. A genuine switch moves the point to the new blade
+        // immediately; small per-frame motion leaves the anchor constant, so
+        // the Kalman smoothing is preserved.
+        {
+            const double filtered_phase = kalman_.statePost.at<double>(0, 0);
+            // Fold the difference into (-pi, pi] before dividing: raw_angle
+            // wraps at +/-pi while the filtered phase is continuous, so dividing
+            // the unfolded difference would step the anchor by 360 degrees (five
+            // whole blades) on every half turn of the image angle. Five blade
+            // periods are a no-op for the point, but the folded form keeps the
+            // anchor within one blade of zero and the arithmetic exact.
+            const double measurement_delta = std::remainder(
+                raw_angle - filtered_phase, 2.0 * CV_PI);
+            const int implied_steps = static_cast<int>(
+                std::lround(measurement_delta / kBladePeriod));
+            if (implied_steps == blade_anchor_steps_) {
+                pending_anchor_count_ = 0;
+            } else if (implied_steps == pending_anchor_steps_) {
+                // Require the new blade on two consecutive frames: a real
+                // 靶子 switch persists, while a one-frame keypoint excursion
+                // must not be allowed to flip the aim point by a whole blade.
+                if (++pending_anchor_count_ >= kAnchorConfirmFrames) {
+                    blade_anchor_steps_ = implied_steps;
+                    pending_anchor_count_ = 0;
+                }
+            } else {
+                pending_anchor_steps_ = implied_steps;
+                pending_anchor_count_ = 1;
+            }
+        }
+        const double phase = kalman_.statePost.at<double>(0, 0) +
+            kBladePeriod * blade_anchor_steps_;
         const double omega = kalman_.statePost.at<double>(1, 0);
         const double future_phase = phase + omega * predict_seconds;
         predicted_center = center_ + cv::Point2f(
@@ -274,6 +323,7 @@ public:
 		initialized_ = false;
 		last_timestamp_ = 0.0;
 		last_observed_phase_ = 0.0;
+		resetBladeAnchor();
 		radius_ = 0.0;
 		center_ = cv::Point2f(0.0f, 0.0f);
 		direction_votes_ = 0;
@@ -289,6 +339,12 @@ public:
 		}
     }
 	int lockedDirection() const { return locked_direction_; }
+	// Multiple of 2*pi/5 that anchors the blade-invariant Kalman phase to the
+	// blade the detector currently reports (the lit target). 0 right after
+	// (re)initialization, +/- the blade period after a confirmed 靶子 switch.
+	double bladeAnchorRadians() const {
+		return kBladePeriod * static_cast<double>(blade_anchor_steps_);
+	}
 
 private:
     void initializeKalman(double phase) {
@@ -321,6 +377,12 @@ private:
             dt2 * kPhaseProcessNoise);
     }
 
+    void resetBladeAnchor() {
+        blade_anchor_steps_ = 0;
+        pending_anchor_steps_ = 0;
+        pending_anchor_count_ = 0;
+    }
+
     static double wrapBladeDelta(double delta) {
         return std::remainder(delta, kBladePeriod);
     }
@@ -332,6 +394,11 @@ private:
     bool initialized_ = false;
     double last_timestamp_ = 0.0;
     double last_observed_phase_ = 0.0;
+    // Blade identity is carried as an integer number of 2*pi/5 steps so the
+    // anchor comparison in the confirmation logic is exact.
+    int blade_anchor_steps_ = 0;
+    int pending_anchor_steps_ = 0;
+    int pending_anchor_count_ = 0;
     double radius_ = 0.0;
     cv::Point2f center_{0.0f, 0.0f};
     int direction_votes_ = 0;

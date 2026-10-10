@@ -6,6 +6,10 @@
 
 // 前置声明: 坐标变换器(全局, main中初始化)
 extern CoordinateTransformer* g_coorConverter;
+// All image-derived predictors, including the optional world EKF, share the
+// callback monotonic timestamp. The ROS header stamp is only used to match the
+// IMU pose and is not the predictor time base.
+extern double g_frame_monotonic_time_seconds;
 
 // Persistent rotation direction: +1=CW, -1=CCW, 0=unknown
 extern int g_buff_rotation_sign;
@@ -14,7 +18,9 @@ extern int g_buff_rotation_sign;
 class PnPSolver_gravity
 {
 public:
-
+double lastReprojectionError() const {
+    return last_reprojection_error_;
+}
 // Debug only: compare both quaternion directions without affecting the
 // existing camera -> gun -> trajectory -> /auto_angle control path.
 void logImuImageSync(const Eigen::Vector3d& target_cam_m) const//打印IMU和相机同步信息
@@ -169,6 +175,7 @@ bool buildWorldObservation(const cv::Point2f& top, const cv::Point2f& left,
                            BuffWorldObservation& observation)
 {
     if (!g_has_frame_imu_pose || g_frame_image_stamp.isZero() ||
+        !std::isfinite(g_frame_monotonic_time_seconds) ||
         g_coorConverter == nullptr) {
         return false;
     }
@@ -223,7 +230,7 @@ bool buildWorldObservation(const cv::Point2f& top, const cv::Point2f& left,
         ? quaternion_rotation : quaternion_rotation.transpose();
     const Eigen::Vector3d map_translation = g_coorConverter->imu2Map_trans_mat;
 
-    observation.stamp_seconds = g_frame_image_stamp.toSec();
+    observation.stamp_seconds = g_frame_monotonic_time_seconds;
     observation.target_center_map = imu_to_map_rotation *
         g_coorConverter->cam2Imu(target_center_cam) + map_translation;
     observation.r_center_map = imu_to_map_rotation *

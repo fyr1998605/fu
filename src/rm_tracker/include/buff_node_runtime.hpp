@@ -1,8 +1,31 @@
 #pragma once
 
+#include <string>
+#include <cstdint>
+#include <cmath>
+#include <chrono>
+#include <limits>
+
+#include "buff_big_ransac_predictor.hpp"
+#include "buff_big_variable_speed_predictor.hpp"
+#include "buff_big_prediction_gate.hpp"
+
 extern int g_buff_rotation_sign;
+extern bool g_buff_world_ekf_primary;
 
 extern int g_persistent_rotation_dir;
+extern bool g_buff_big_ransac_enabled;
+extern buff_zju::BigBuffRansacPredictor* g_big_buff_predictor;
+extern buff_zju::BigBuffVariableSpeedPredictor* g_big_variable_speed_predictor;
+extern buff_zju::BigBuffPredictionGate g_big_prediction_gate;
+extern bool g_buff_big_variable_speed_enabled;
+extern double g_big_variable_speed_prediction_angle;
+extern bool g_big_variable_speed_prediction_valid;
+extern std::string MoveMode;
+extern std::uint64_t g_frame_sequence;
+extern std::uint64_t g_processed_frame_sequence;
+extern double g_frame_monotonic_time_seconds;
+extern double g_last_big_buff_timestamp;
 // Buff serial/image callbacks and Fu_Task extracted from Fu.cpp without logic changes.
 
 void doserial(const rm_msgs::RmSerialConstPtr serail)
@@ -27,6 +50,7 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
             g_imu_pose_history.pop_front();
         }
     }
+    const bool previous_functional = functional;
     if(serail->ShootFlag == 'f'){
         ROS_INFO_THROTTLE(2.0, "[Fu] 串口指令: 大符模式, Fu节点激活");
         functional = true;
@@ -37,6 +61,20 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
     }else{
         ROS_WARN_THROTTLE(2.0, "[Fu] 未知 ShootFlag='%c', 默认休眠", serail->ShootFlag);
         functional = false;
+    }
+    if (functional != previous_functional && g_big_buff_predictor != nullptr) {
+        // A stop/start command starts a new observation session. Do not mix
+        // the previous roll/velocity window with the next activation after a
+        // potentially long pause, even when the camera clock is continuous.
+        g_big_buff_predictor->reset();
+        g_last_big_buff_timestamp =
+            std::numeric_limits<double>::quiet_NaN();
+    }
+    if (functional != previous_functional &&
+        g_big_variable_speed_predictor != nullptr) {
+        g_big_variable_speed_predictor->reset();
+        g_big_prediction_gate.reject();
+        g_big_variable_speed_prediction_valid = false;
     }
     if(serail->Camp=='b')
     {
@@ -59,6 +97,7 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
     //doimage是ROS图像回调，接收相机图像转OpenCV格式，更新相机状态，调用能量机关主处理函数Fu_Task完成全套视觉运算。
     void doimage(const sensor_msgs::ImageConstPtr img)
     {
+        const auto frame_received_at = std::chrono::steady_clock::now();
         cv_bridge::CvImagePtr cv_ptr; // 声明一个CvImage指针的实例
         try
         //try{}：异常监测代码块，包裹图像转换逻辑，捕捉转换时出现的错误。
@@ -75,6 +114,9 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
         frame_ = cv_ptr->image.clone();//将OpenCV图像复制给frame_，避免直接操作ROS图像
 
         g_frame_image_stamp = img->header.stamp;//记录当前图像的时间戳
+        g_frame_monotonic_time_seconds = std::chrono::duration<double>(
+            frame_received_at.time_since_epoch()).count();
+        ++g_frame_sequence;
         g_has_frame_imu_pose = findClosestImuPose(
             g_frame_image_stamp, g_frame_imu_pose);//查找最近的IMU姿态，记录在g_frame_imu_pose中，返回是否找到
 
@@ -83,6 +125,15 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
                ros::Duration(g_imu_stamp_offset_seconds) -
                g_frame_image_stamp).toSec()
             : std::numeric_limits<double>::quiet_NaN();//计算当前图像与最近IMU时间偏移，单位秒
+
+        ROS_INFO_THROTTLE(
+            1.0,
+            "[BUFF_SYNC] frame=%llu image_ros=%.6f image_mono=%.6f "
+            "imu=%s skew=%+.2fms queue=latest(1)",
+            static_cast<unsigned long long>(g_frame_sequence),
+            g_frame_image_stamp.toSec(), g_frame_monotonic_time_seconds,
+            g_has_frame_imu_pose ? "matched" : "missing",
+            g_frame_imu_image_skew_seconds * 1000.0);
 
         // cout << "111111111111111111111111111111111111111111111" << endl;
         // cout << "66666666666666666666666666666666666666666666" << endl;
@@ -119,6 +170,22 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
         if(frame.empty()){
             return false;
         }
+        // The main loop can run faster than the image callback. Consume each
+        // image sequence exactly once so processing jitter is never used as a
+        // motion timestamp and the same detection is not fitted repeatedly.
+        if (g_frame_sequence == 0 ||
+            g_frame_sequence == g_processed_frame_sequence) {
+            return false;
+        }
+        g_processed_frame_sequence = g_frame_sequence;
+        // Feed gimbal feedback only to the big-buff path. The recognizer's
+        // compensated pixel gate is shared with ordinary candidate selection,
+        // so keeping this disabled in small mode preserves its old behavior.
+        if (MoveMode == "big") {
+            g_recognizer->feedGimbalFeedback(
+                static_cast<float>(RmSerialData.Pitch),
+                static_cast<float>(RmSerialData.Yaw));
+        }
     //帧率计算
 
     std::chrono::steady_clock::time_point fps_start = std::chrono::steady_clock::now();//记录当前时间点
@@ -150,6 +217,16 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
         // ②③ 创建下游处理模块
         Angleprocess = new Fu_angleprocess();        // 角度处理器: 极坐标+累加+差分
         Predicted = new buff_predicted();            // 预测器: FFT频率+正弦拟合+滑动平均
+        if (g_big_buff_predictor != nullptr) {
+            g_big_buff_predictor->reset();
+            g_last_big_buff_timestamp =
+                std::numeric_limits<double>::quiet_NaN();
+        }
+        if (g_big_variable_speed_predictor != nullptr) {
+            g_big_variable_speed_predictor->reset();
+        }
+        g_big_prediction_gate.reject();
+        g_big_variable_speed_prediction_valid = false;
         pnpSolver_gravity = new PnPSolver_gravity(
             g_buff_target_width_mm, g_buff_target_height_mm,
             g_buff_camera_matrix, g_buff_dist_coeffs);//创建PnP解算器，初始化相机参数，返回是否成功
@@ -162,7 +239,7 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
             g_corners[0], g_corners[1], g_corners[2], g_corners[3],  // ★ 真实角点
             RmSerialData.Pitch);//计算PnP解算时间，返回是否成功
         if (pnpSolver_gravity->time_parameter < 2.0){  // ★ 放宽阈值: 0.5→2.0秒
-            delta_t_ = pnpSolver_gravity->time_parameter + delta_t_compensation;//计算弹丸飞行时间，单位秒，补偿时间
+            delta_t_ = pnpSolver_gravity->time_parameter + buffTotalLeadCompensation();//飞行时间 + 视觉链路延迟 + 电控延时
             // cout << "70000000000000007777" << endl;
 
         }else{
@@ -180,18 +257,13 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
         final_angle_2D = {0, 0};//最终角度对应的图像点
         euler_angles = {0, 0};//储存发送的空间角
 
-        start = std::chrono::steady_clock::now();//时间基础
-
         init = true;//完成初始化
         // cout << "71111111111111111177" << endl;
     }
 
     // 帧计数，用于限频打印
     //记录时间
-    std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();//首时间
-    std::chrono::steady_clock::duration time = end - start;//计算时间差
-    // 将时间差强制转为毫秒，获取数值
-    time_milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(time).count();//转换时间单位
+    time_milliseconds = g_frame_monotonic_time_seconds * 1000.0;
     //time_milliseconds = 1/fps__*1000+time_milliseconds;
     //cout << "时间：" << time_milliseconds << endl;
 
@@ -211,7 +283,7 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
 // cout << "22222222222222222222777777" << endl;
     // ★ 识别成功后无论下游是否失败, 都先画检测框再跑跟踪链
     // 下游失败时只画检测, 不发布角度 (track_ok = false)
-    bool track_ok = true;
+    bool track_ok = false;
 
     // Debug only: use this frame's measured keypoints, not the predicted point.
     pnpSolver_gravity->logObservedPnP(
@@ -302,19 +374,75 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
       // 这一步无论卡尔曼是否正常都会执行，确保切兜底时不需要预热
       {
           static double fallback_fps = 120.0;  // 运行中 EMA 估计
-          static auto last_feed_time = std::chrono::steady_clock::now();
-          auto now = std::chrono::steady_clock::now();
-          double interval_ms =
-  std::chrono::duration_cast<std::chrono::milliseconds>(
-              now - last_feed_time).count();
-          last_feed_time = now;
-          if (interval_ms > 0.0 && interval_ms < 500.0) {
-              fallback_fps = 0.9 * fallback_fps + 0.1 * (1000.0 / interval_ms);
+          static double last_frame_time_seconds =
+              std::numeric_limits<double>::quiet_NaN();
+          const double frame_time_seconds = g_frame_monotonic_time_seconds;
+          const double frame_interval_seconds =
+              frame_time_seconds - last_frame_time_seconds;
+          last_frame_time_seconds = frame_time_seconds;
+          if (std::isfinite(frame_interval_seconds) &&
+              frame_interval_seconds > 1e-4 && frame_interval_seconds < 0.5) {
+              fallback_fps = 0.9 * fallback_fps +
+                  0.1 * (1.0 / frame_interval_seconds);
           }
 
+          Angleprocess->set_image_size(frame.cols, frame.rows);
           double angle_diff_temp = Angleprocess->pre_predict_angle_process(
               g_R_center, g_Fan_center, time_milliseconds, delta_t_,
   fallback_fps);
+          // RANSAC 采样与旧角度差分解耦：只要本帧极角新鲜（图幅内）就喂给
+          // RANSAC，不再依赖旧差分算法返回有效值（旧算法首帧/丢帧/扇叶跳变会返回 -1）
+          if (buff_zju::is_big_buff_ransac_active(
+                  g_buff_big_ransac_enabled, MoveMode) &&
+              g_big_buff_predictor != nullptr &&
+              Angleprocess->last_frame_polar_valid) {
+              if (Angleprocess->anticlockwise_flag) {
+                  g_buff_rotation_sign = Angleprocess->anticlockwise ? 1 : -1;
+              }
+              g_big_buff_predictor->set_rotation_sign(g_buff_rotation_sign);
+              const double predictor_timestamp =
+                  g_frame_monotonic_time_seconds;
+              if (std::isfinite(predictor_timestamp)) {
+                  const bool timestamp_repeated =
+                      std::isfinite(g_last_big_buff_timestamp) &&
+                      predictor_timestamp == g_last_big_buff_timestamp;
+                  if (std::isfinite(g_last_big_buff_timestamp) &&
+                      predictor_timestamp < g_last_big_buff_timestamp) {
+                      // A clock reset cannot be mixed into the existing fit window.
+                      g_big_buff_predictor->reset();
+                  }
+                  if (!timestamp_repeated) {
+                      g_big_buff_predictor->update_polar(
+                          predictor_timestamp,
+                          static_cast<double>(Angleprocess->angle_polar_now));
+                      g_last_big_buff_timestamp = predictor_timestamp;
+                  }
+              }
+          }
+          if (MoveMode == "big" && g_buff_big_variable_speed_enabled &&
+              g_big_variable_speed_predictor != nullptr &&
+              Angleprocess->last_frame_polar_valid) {
+              double variable_speed_prediction = 0.0;
+              const bool variable_speed_update_ok =
+                  g_big_variable_speed_predictor->update(
+                  g_frame_monotonic_time_seconds,
+                  static_cast<double>(Angleprocess->angle_polar_now),
+                  delta_t_, variable_speed_prediction);
+              if (variable_speed_update_ok &&
+                  std::isfinite(variable_speed_prediction)) {
+                  // The result is consumed after the shared small-buff path
+                  // below. Until the variable-speed model has ten samples,
+                  // the small-buff Kalman remains the safe fallback.
+                  g_big_variable_speed_prediction_angle =
+                      variable_speed_prediction;
+                  g_big_variable_speed_prediction_valid =
+                      g_big_variable_speed_predictor->ready();
+              } else {
+                  g_big_variable_speed_prediction_valid = false;
+              }
+          } else {
+              g_big_variable_speed_prediction_valid = false;
+          }
           if (angle_diff_temp != -1) {
              angle_diff_temp = std::remainder(angle_diff_temp, 2.0 * CV_PI);
 				// Update global rotation direction from angle processor
@@ -363,6 +491,18 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
 
       kalman_healthy ? kalman_bad_frames = 0 : kalman_bad_frames++;
 
+      // ====== 调试日志：状态概览（已移至此，确保变量已定义）======
+      ROS_INFO_THROTTLE(
+          0.5,
+          "[BUFF_STATE] pixel_track_ok=%s kalman_healthy=%s track_ok=%s "
+          "final_angle_2d=(%.1f,%.1f) radius=%.1f bad_frames=%d",
+          pixel_track_ok ? "true" : "false",
+          kalman_healthy ? "true" : "false",
+          track_ok ? "true" : "false",
+          final_angle_2D.x, final_angle_2D.y,
+          Angleprocess != nullptr ? Angleprocess->radius_buff : -1.0f,
+          kalman_bad_frames);
+
       // ---- Step 4: 决策 ----
       static bool using_fallback = false;
       static int  fallback_fail_cnt = 0;
@@ -387,7 +527,7 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
           // predicted_diff_angle = 过去 delta_t 秒内转过的角度 (EMA平滑)
           // final_angle = 当前极角 + 预测提前量
           // final_angle_2D = 极坐标 → 像素坐标
-          static std::string fallback_mode = "small";
+          static std::string fallback_mode = MoveMode;
         //   angle_diff = std::remainder(angle_diff, 2.0 * CV_PI); // 角度归一化
           predicted_diff_angle = Predicted->predicted(
               angle_diff, angle_diff_time, fallback_mode, delta_t_,
@@ -429,8 +569,48 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
       }
 
 
+    // Big mode shares the small-buff observation/validation/output path, but
+    // replaces its constant-speed phase extrapolation with the variable-speed
+    // phase model after ten valid samples and phase-agreement gating. The small-buff Kalman remains the
+    // startup/dropout fallback so mode switching cannot create a dead period.
+    if (MoveMode == "big" && g_big_variable_speed_prediction_valid &&
+        pixel_track_ok && kalman_healthy &&
+        Angleprocess->radius_buff > 1.0f) {
+        const double predicted_roll =
+            g_big_variable_speed_prediction_angle;
+        const cv::Point2f zju_predicted_point =
+            Angleprocess->post_predict_angle_process(
+                predicted_roll, Angleprocess->radius_buff);
+        const bool finite_point =
+            std::isfinite(zju_predicted_point.x) &&
+            std::isfinite(zju_predicted_point.y);
+        const bool inside_frame =
+            finite_point && zju_predicted_point.x > 0.0f &&
+            zju_predicted_point.x <= static_cast<float>(frame.cols) &&
+            zju_predicted_point.y > 0.0f &&
+            zju_predicted_point.y <= static_cast<float>(frame.rows);
+        if (inside_frame) {
+            const bool gate_active = g_big_prediction_gate.update(true);
+            if (gate_active) {
+                final_angle_2D = zju_predicted_point;
+                track_ok = true;
+            } else {
+                ROS_WARN_THROTTLE(
+                    0.5,
+                    "[Fu] 大符变速预测尚未连续稳定，保留主路径: "
+                    "big=%.1fdeg",
+                    predicted_roll * 180.0 / CV_PI);
+            }
+        } else {
+            g_big_prediction_gate.reject();
+        }
+    } else if (MoveMode == "big") {
+        g_big_prediction_gate.reject();
+    }
+
     // --- World-frame EKF + two flight-time iterations (disabled by default) ---
-     if (g_buff_world_ekf_enabled && g_buff_world_ekf_control_enabled &&world_observation_ready) {//g_buff_world_ekf_enabled && g_buff_world_ekf_control_enabled &&//如果世界帧跟踪器已启用world_observation_ready
+     if (g_buff_world_ekf_enabled && g_buff_world_ekf_control_enabled &&
+         g_buff_world_ekf_primary && world_observation_ready) {// EKF is opt-in as the output path.
         track_ok = true;
         euler_angles.x = 0;
         euler_angles.y = 0;
@@ -445,7 +625,7 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
             euler_angles = pnpSolver_gravity->solveMapPointAndGravity(
                 future_target_map);
             const double new_hit_time =
-                pnpSolver_gravity->time_parameter + delta_t_compensation;
+                pnpSolver_gravity->time_parameter + buffTotalLeadCompensation();
             if ((euler_angles.x == 0.0 && euler_angles.y == 0.0) ||
                 !std::isfinite(new_hit_time) || new_hit_time <= 0.01 ||
                 new_hit_time >= 1.0) {
@@ -465,6 +645,10 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
             g_corners[0], g_corners[1], g_corners[2], g_corners[3],
             g_R_center, g_Fan_center, final_angle_2D,
             RmSerialData.Pitch);//
+        ROS_INFO_THROTTLE(
+            0.5,
+            "[BUFF_PNP] reprojection_error=%.3f px",
+            pnpSolver_gravity->lastReprojectionError());
         if (euler_angles.x == 0.0 && euler_angles.y == 0.0) {
             track_ok = false;
             cout<<"4444444444444"<<endl;
@@ -473,12 +657,13 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
         // cout<<"55555555555555555"<<endl;
 
 
+
     }
 
     // Refresh the next-frame lead time from whichever valid trajectory path ran.
     if (track_ok) {
         const double measured_lead_time =
-            pnpSolver_gravity->time_parameter + delta_t_compensation;//计算当前帧的时间间隔
+            pnpSolver_gravity->time_parameter + buffTotalLeadCompensation();//飞行时间 + 视觉链路延迟 + 电控延时
         if (std::isfinite(measured_lead_time) &&
             measured_lead_time > 0.01 && measured_lead_time < 1.0) {
             delta_t_ = 0.8 * delta_t_ + 0.2 * measured_lead_time;//更新时间步长
@@ -490,47 +675,88 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
 
     // --- 发布角度 ---
     if (track_ok) {
-    Angle.x = -RmSerialData.Pitch + (euler_angles.x + pitch_compensation);
-    Angle.y = RmSerialData.Yaw + (euler_angles.y + yaw_compensation);
+        // 原始计算角度（限幅前）
+        double raw_angle_x = -RmSerialData.Pitch + (euler_angles.x + pitch_compensation);
+        double limited_angle_x = raw_angle_x;
+        Angle.x = limited_angle_x;   // 暂存，随后可能被限幅覆盖
+        Angle.y = RmSerialData.Yaw + (euler_angles.y + yaw_compensation);
 
-    // ========== Pitch limiter + aggressive stuck recovery ==========
-    const double PITCH_MAX_RAD = 22.0 * CV_PI / 180.0;
-    const double PITCH_MIN_RAD = -15.0 * CV_PI / 180.0;
-    if (Angle.x > PITCH_MAX_RAD) Angle.x = PITCH_MAX_RAD;
-    if (Angle.x < PITCH_MIN_RAD) Angle.x = PITCH_MIN_RAD;
-    
-    // Stuck recovery: when gimbal is near mechanical limit for >250ms,
-    // command a strong downward pulse to unwind the MCU PID integrator.
-    static int   stuck_frames = 0;
-    static bool  recovery_active = false;
-    static int   recovery_remaining = 0;
-    const double STUCK_THRESH_RAD = 19.0 * CV_PI / 180.0;
-    
-    if (recovery_active) {
-    	// Force gimbal down aggressively for several frames.
-    	Angle.x = -10.0 * CV_PI / 180.0;
-    	recovery_remaining--;
-    	if (recovery_remaining <= 0) {
-    		recovery_active = false;
-    		stuck_frames = 0;
-    		ROS_INFO("[Fu] Gimbal recovery complete, resuming normal tracking");
-    	}
-    } else if (RmSerialData.Pitch > STUCK_THRESH_RAD) {
-    	stuck_frames++;
-    	if (stuck_frames > 30) {
-    		recovery_active = true;
-    		recovery_remaining = 15;  // ~125ms at 120fps
-    		ROS_WARN("[Fu] Gimbal STUCK at %.1f deg, forcing recovery down!",
-    		         RmSerialData.Pitch * 180.0 / CV_PI);
-    	}
-    } else {
-    	stuck_frames = 0;
+        // ========== Pitch limiter + aggressive stuck recovery ==========
+        const double PITCH_MAX_RAD = 22.0 * CV_PI / 180.0;
+        const double PITCH_MIN_RAD = -15.0 * CV_PI / 180.0;
+        if (limited_angle_x > PITCH_MAX_RAD) limited_angle_x = PITCH_MAX_RAD;
+        if (limited_angle_x < PITCH_MIN_RAD) limited_angle_x = PITCH_MIN_RAD;
+        Angle.x = limited_angle_x;   // 应用限幅后的值
+
+        // Stuck recovery: when gimbal is near mechanical limit for >250ms,
+        // command a strong downward pulse to unwind the MCU PID integrator.
+        static int   stuck_frames = 0;
+        static bool  recovery_active = false;
+        static int   recovery_remaining = 0;
+        const double STUCK_THRESH_RAD = 19.0 * CV_PI / 180.0;
+
+        if (recovery_active) {
+            // Force gimbal down aggressively for several frames.
+            Angle.x = -10.0 * CV_PI / 180.0;
+            recovery_remaining--;
+            if (recovery_remaining <= 0) {
+                recovery_active = false;
+                stuck_frames = 0;
+                ROS_INFO("[Fu] Gimbal recovery complete, resuming normal tracking");
+            }
+        } else if (RmSerialData.Pitch > STUCK_THRESH_RAD) {
+            stuck_frames++;
+            if (stuck_frames > 30) {
+                recovery_active = true;
+                recovery_remaining = 15;  // ~125ms at 120fps
+                ROS_WARN("[Fu] Gimbal STUCK at %.1f deg, forcing recovery down!",
+                         RmSerialData.Pitch * 180.0 / CV_PI);
+            }
+        } else {
+            stuck_frames = 0;
+        }
+        // =====================================================================
+
+        Angle.z = 1;
+
+        const bool pitch_limited =
+            std::isfinite(raw_angle_x) &&
+            std::abs(raw_angle_x - limited_angle_x) > 1e-9;
+
+        if (pitch_limited || !track_ok || !pixel_track_ok ||
+            !kalman_healthy) {
+            ROS_WARN_THROTTLE(
+                0.2,
+                "[BUFF_ANGLE] raw_angle_x=%.6f rad (%.2f deg), "
+                "limited_angle_x=%.6f rad (%.2f deg), "
+                "pixel_track_ok=%s kalman_healthy=%s track_ok=%s "
+                "reproj=%.3f px",
+                raw_angle_x, raw_angle_x * 180.0 / CV_PI,
+                limited_angle_x, limited_angle_x * 180.0 / CV_PI,
+                pixel_track_ok ? "true" : "false",
+                kalman_healthy ? "true" : "false",
+                track_ok ? "true" : "false",
+                pnpSolver_gravity->lastReprojectionError());
+        }
+        PubAngle.publish(Angle);
+
+        // ═══ 实测视觉链路延迟: 曝光 → 本帧角度下发 ═══
+        // 在 publish 之后取 (现在 - 图像时间戳), 量到的就是本帧从曝光到出角度的
+        // 完整链路耗时(相机传输 + ROS 队列积压 + YOLO 推理 + PnP)。只在本帧真的
+        // 下发了角度时采样 —— 失败帧/空转帧的图像年龄没有意义, 会污染 EMA。
+        // auto 关掉时也照样采样, 只是不参与计算: 日志里的「实测」就是现场标定值。
+        buffUpdateVisionDelayEstimate();
+        ROS_INFO_THROTTLE(
+            1.0,
+            "[BUFF_DELAY] 视觉链路 实测=%.1f ms 生效=%.1f ms, 电控=%.1f ms | "
+            "总提前量=%.1f ms (其中弹丸飞行 %.1f ms)",
+            vision_delay_measured_seconds * 1000.0,
+            (vision_delay_auto && vision_delay_ema_seconds > 0.0
+                 ? vision_delay_ema_seconds : vision_delay_seconds) * 1000.0,
+            ec_delay_seconds * 1000.0,
+            delta_t_ * 1000.0,
+            pnpSolver_gravity->time_parameter * 1000.0);
     }
-    // =====================================================================
-
-    Angle.z = 1;
-    PubAngle.publish(Angle);
-}
     // ★ debug发布: 始终发布, 不依赖track_ok
     // /debugpub      → 期望角pitch (跟踪成功=计算值, 失败=-平台pitch)
     // /debugpub1     → 平提出轴角度
@@ -541,7 +767,7 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
         std_msgs::Float64 debug_msg_x, debug_msg_y;
         std_msgs::Float64 debug_msg_omega, debug_msg_reproj;
         debug_msg_x.data = track_ok ? Angle.x : -RmSerialData.Pitch;
-        debug_msg_y.data = RmSerialData.Pitch;    // 平提出轴角度
+        debug_msg_y.data = -RmSerialData.Pitch;    // 平提出轴角度
         debug_msg_omega.data = (g_buff_world_ekf_enabled && world_observation_ready)
             ? g_buff_world_tracker.omegaRadPerSecond()
             : std::numeric_limits<double>::quiet_NaN();
@@ -603,7 +829,9 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
     std::chrono::steady_clock::duration fps_time = fps_end - fps_start;//计算时间差
     fps_time_milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(fps_time).count();//转换时间单位
     //cout << "运行总时间：" << fps_time_milliseconds << endl;
-    fps_ = 1.0 / (fps_time_milliseconds*0.001);
+    fps_ = fps_time_milliseconds > 0.0
+        ? 1000.0 / fps_time_milliseconds
+        : 0.0;
     sprintf(buffer, "%.2f", fps_); // 帧率保留两位小数
     std::string fpsString = "FPS:" + std::string(buffer); // 在"FPS:"后加入帧率数值字符串
     cv::putText(frame, fpsString, cv::Point(10, 40), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(255, 255, 255));// 将帧率信息写在输出帧上l
@@ -626,4 +854,3 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
 
 return false;
 }
-

@@ -97,6 +97,14 @@ class FuConfigLayoutTest(unittest.TestCase):
         self.assertIn("ready_good_frames_", tracker)
         self.assertIn("ready_bad_frames_", tracker)
 
+    def test_target_lock_is_scoped_to_big_buff_mode(self):
+        source = FU_SOURCE.read_text(encoding="utf-8")
+        self.assertIn(
+            'g_recognizer->setTargetPriority(\n'
+            '        MoveMode == "big" ? buff_target_priority : "confidence",',
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

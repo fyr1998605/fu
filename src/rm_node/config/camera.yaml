@@ -7,7 +7,7 @@ Offset_y: 0             #Y方向偏置
 FrameRateEnable: true   #使能 
 FrameRate: 120          #帧率120
 
-ExposureTime: 3000   #曝光时间9000    2300 1800 1550
+ExposureTime: 2300   #曝光时间9000    2300 1800 1550
 
 GammaEnable: false
 Gamma: 1              #伽马因子
