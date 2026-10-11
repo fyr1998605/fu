@@ -29,6 +29,16 @@ void BigBuffVariableSpeedPredictor::reset() {
     initialized_ = false;
 }
 
+double BigBuffVariableSpeedPredictor::prediction_lead(
+    const double horizon_seconds) const {
+    if (!std::isfinite(horizon_seconds) || horizon_seconds < 0.0 ||
+        horizon_seconds > kMaxPredictionSeconds) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return angular_speed_ * horizon_seconds +
+        0.5 * angular_acceleration_ * horizon_seconds * horizon_seconds;
+}
+
 bool BigBuffVariableSpeedPredictor::initialize(
     const double timestamp_seconds, const double raw_angle) {
     if (!std::isfinite(timestamp_seconds) || !std::isfinite(raw_angle)) {
@@ -130,9 +140,7 @@ bool BigBuffVariableSpeedPredictor::update(
         return false;
     }
 
-    predicted_angle = normalize_angle(
-        phase_ + angular_speed_ * horizon_seconds +
-        0.5 * angular_acceleration_ * horizon_seconds * horizon_seconds);
+    predicted_angle = normalize_angle(phase_ + prediction_lead(horizon_seconds));
     return std::isfinite(predicted_angle);
 }
 

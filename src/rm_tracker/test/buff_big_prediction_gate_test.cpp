@@ -39,5 +39,27 @@ int main() {
     require(!gate.update(true));
     require(!gate.update(true));
     require(gate.update(true));
+
+    // Large-buff output is anchored to the currently detected bright blade.
+    // Changing the detected blade by one 72-degree alias must not preserve
+    // the previous absolute phase.
+    const double lead = 0.18;
+    const double first_blade = 0.20;
+    const double next_blade = first_blade + 2.0 * kPi / 5.0;
+    require(std::abs(buff_zju::bigBuffPredictionAngle(first_blade, lead) -
+                     (first_blade + lead)) < 1e-9);
+    require(std::abs(buff_zju::bigBuffPredictionAngle(next_blade, lead) -
+                     (next_blade + lead)) < 1e-9);
+
+    // A sudden lead jump is rejected instead of moving the output across a
+    // blade alias.
+    double stable_lead = 0.0;
+    buff_zju::BigBuffPredictionGate lead_gate;
+    require(!lead_gate.updateLead(true, 0.18, 1, stable_lead));
+    require(!lead_gate.updateLead(true, 0.19, 1, stable_lead));
+    require(lead_gate.updateLead(true, 0.20, 1, stable_lead));
+    require(std::abs(stable_lead - 0.20) < 1e-9);
+    require(!lead_gate.updateLead(true, 1.20, 1, stable_lead));
+    require(!lead_gate.active());
     return 0;
 }

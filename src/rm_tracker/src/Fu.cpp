@@ -242,7 +242,7 @@ buff_predicted* Predicted = nullptr;;//创建预测器
 buff_zju::BigBuffRansacPredictor* g_big_buff_predictor = nullptr;
 buff_zju::BigBuffVariableSpeedPredictor* g_big_variable_speed_predictor = nullptr;
 buff_zju::BigBuffPredictionGate g_big_prediction_gate;
-double g_big_variable_speed_prediction_angle = 0.0;
+double g_big_variable_speed_prediction_lead = 0.0;
 bool g_big_variable_speed_prediction_valid = false;
 PnPSolver_gravity* pnpSolver_gravity = nullptr;;//创建重力补偿器
 CoordinateTransformer* g_coorConverter = nullptr;   //相机→枪管坐标变换

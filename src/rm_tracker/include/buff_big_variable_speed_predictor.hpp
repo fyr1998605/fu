@@ -11,6 +11,11 @@ public:
                 double& predicted_angle);
     void reset();
 
+    // Return only the future angular lead. The caller supplies the current
+    // bright-blade angle when constructing the output point, so aliases in
+    // the predictor's accumulated phase cannot change blade identity.
+    double prediction_lead(double horizon_seconds) const;
+
     bool ready() const { return accepted_samples_ >= kWarmupSamples; }
     double angular_speed() const { return angular_speed_; }
     double angular_acceleration() const { return angular_acceleration_; }

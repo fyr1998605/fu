@@ -19,7 +19,7 @@ extern buff_zju::BigBuffRansacPredictor* g_big_buff_predictor;
 extern buff_zju::BigBuffVariableSpeedPredictor* g_big_variable_speed_predictor;
 extern buff_zju::BigBuffPredictionGate g_big_prediction_gate;
 extern bool g_buff_big_variable_speed_enabled;
-extern double g_big_variable_speed_prediction_angle;
+extern double g_big_variable_speed_prediction_lead;
 extern bool g_big_variable_speed_prediction_valid;
 extern std::string MoveMode;
 extern std::uint64_t g_frame_sequence;
@@ -75,6 +75,7 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
         g_big_variable_speed_predictor->reset();
         g_big_prediction_gate.reject();
         g_big_variable_speed_prediction_valid = false;
+        g_big_variable_speed_prediction_lead = 0.0;
     }
     if(serail->Camp=='b')
     {
@@ -227,6 +228,7 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
         }
         g_big_prediction_gate.reject();
         g_big_variable_speed_prediction_valid = false;
+        g_big_variable_speed_prediction_lead = 0.0;
         pnpSolver_gravity = new PnPSolver_gravity(
             g_buff_target_width_mm, g_buff_target_height_mm,
             g_buff_camera_matrix, g_buff_dist_coeffs);//创建PnP解算器，初始化相机参数，返回是否成功
@@ -433,15 +435,18 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
                   // The result is consumed after the shared small-buff path
                   // below. Until the variable-speed model has ten samples,
                   // the small-buff Kalman remains the safe fallback.
-                  g_big_variable_speed_prediction_angle =
-                      variable_speed_prediction;
+                  g_big_variable_speed_prediction_lead =
+                      g_big_variable_speed_predictor->prediction_lead(delta_t_);
                   g_big_variable_speed_prediction_valid =
-                      g_big_variable_speed_predictor->ready();
+                      g_big_variable_speed_predictor->ready() &&
+                      std::isfinite(g_big_variable_speed_prediction_lead);
               } else {
                   g_big_variable_speed_prediction_valid = false;
+                  g_big_variable_speed_prediction_lead = 0.0;
               }
           } else {
               g_big_variable_speed_prediction_valid = false;
+              g_big_variable_speed_prediction_lead = 0.0;
           }
           if (angle_diff_temp != -1) {
              angle_diff_temp = std::remainder(angle_diff_temp, 2.0 * CV_PI);
@@ -490,18 +495,6 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
       }
 
       kalman_healthy ? kalman_bad_frames = 0 : kalman_bad_frames++;
-
-      // ====== 调试日志：状态概览（已移至此，确保变量已定义）======
-      ROS_INFO_THROTTLE(
-          0.5,
-          "[BUFF_STATE] pixel_track_ok=%s kalman_healthy=%s track_ok=%s "
-          "final_angle_2d=(%.1f,%.1f) radius=%.1f bad_frames=%d",
-          pixel_track_ok ? "true" : "false",
-          kalman_healthy ? "true" : "false",
-          track_ok ? "true" : "false",
-          final_angle_2D.x, final_angle_2D.y,
-          Angleprocess != nullptr ? Angleprocess->radius_buff : -1.0f,
-          kalman_bad_frames);
 
       // ---- Step 4: 决策 ----
       static bool using_fallback = false;
@@ -576,8 +569,9 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
     if (MoveMode == "big" && g_big_variable_speed_prediction_valid &&
         pixel_track_ok && kalman_healthy &&
         Angleprocess->radius_buff > 1.0f) {
-        const double predicted_roll =
-            g_big_variable_speed_prediction_angle;
+        const double predicted_roll = buff_zju::bigBuffPredictionAngle(
+            static_cast<double>(Angleprocess->angle_polar_now),
+            g_big_variable_speed_prediction_lead);
         const cv::Point2f zju_predicted_point =
             Angleprocess->post_predict_angle_process(
                 predicted_roll, Angleprocess->radius_buff);
@@ -590,7 +584,11 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
             zju_predicted_point.y > 0.0f &&
             zju_predicted_point.y <= static_cast<float>(frame.rows);
         if (inside_frame) {
-            const bool gate_active = g_big_prediction_gate.update(true);
+            const bool gate_active = g_big_prediction_gate.updateLead(
+                true,
+                g_big_variable_speed_prediction_lead,
+                g_buff_rotation_sign,
+                g_big_variable_speed_prediction_lead);
             if (gate_active) {
                 final_angle_2D = zju_predicted_point;
                 track_ok = true;
@@ -659,6 +657,19 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
 
 
     }
+
+    // Log the final decision after the big-buff override and PnP validation;
+    // logging before those branches made a valid output appear as track_ok=false.
+    ROS_INFO_THROTTLE(
+        0.5,
+        "[BUFF_STATE] pixel_track_ok=%s kalman_healthy=%s track_ok=%s "
+        "final_angle_2d=(%.1f,%.1f) radius=%.1f bad_frames=%d",
+        pixel_track_ok ? "true" : "false",
+        kalman_healthy ? "true" : "false",
+        track_ok ? "true" : "false",
+        final_angle_2D.x, final_angle_2D.y,
+        Angleprocess != nullptr ? Angleprocess->radius_buff : -1.0f,
+        kalman_bad_frames);
 
     // Refresh the next-frame lead time from whichever valid trajectory path ran.
     if (track_ok) {
