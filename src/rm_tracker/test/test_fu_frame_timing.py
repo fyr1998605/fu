@@ -15,19 +15,34 @@ PNP_SOURCE = REPO_ROOT / "src" / "rm_tracker" / "include" / "buff_pnp_solver.hpp
 
 
 class FuFrameTimingTest(unittest.TestCase):
+    def test_big_acquisition_is_not_reset_when_waiting_for_three_good_frames(self):
+        runtime = RUNTIME_SOURCE.read_text(encoding="utf-8")
+        validation_start = runtime.index("if (pixel_track_ok) {")
+        opening = runtime.index("{", validation_start)
+        depth = 1
+        closing = opening + 1
+        while depth:
+            depth += (runtime[closing] == "{") - (runtime[closing] == "}")
+            closing += 1
+        validation = runtime[opening:closing]
+        decision = runtime[closing:runtime.index("track_ok = pixel_track_ok;", closing)]
+        self.assertIn("g_big_buff_predictor.reject()", validation)
+        self.assertNotIn("g_big_buff_predictor.reject()", decision)
+
     def test_small_and_big_predictors_consume_the_same_monotonic_frame_time(self):
         runtime = RUNTIME_SOURCE.read_text(encoding="utf-8")
         source = FU_SOURCE.read_text(encoding="utf-8")
 
         self.assertIn("g_frame_monotonic_time_seconds", runtime)
         self.assertIn("g_frame_monotonic_time_seconds * 1000.0", runtime)
-        self.assertIn("g_frame_monotonic_time_seconds;", runtime)
+        self.assertIn("g_frame_monotonic_time_seconds,", runtime)
         self.assertIn("std::chrono::steady_clock::now()", runtime)
         self.assertIn('nh.subscribe("/hikrobot_camera/rgb", 1, &doimage)', source)
         self.assertNotIn("g_frame_image_stamp.toSec()", source)
         self.assertNotIn("steady_clock::time_point start", source)
-        self.assertIn("last_frame_time_seconds", runtime)
-        self.assertIn("frame_interval_seconds", runtime)
+        self.assertIn("g_frame_sequence == g_processed_frame_sequence", runtime)
+        self.assertIn("const bool fresh_frame", source)
+        self.assertIn('if (fresh_frame) cv::imshow', source)
         self.assertNotIn("last_feed_time", runtime)
 
     def test_big_buff_refits_are_rate_limited(self):
@@ -38,7 +53,7 @@ class FuFrameTimingTest(unittest.TestCase):
         self.assertIn("fit_samples_since_last_fit_", source)
         self.assertIn("config_.fit_every_n_samples", source)
 
-    def test_variable_speed_prediction_remains_enabled_for_big_buff(self):
+    def test_big_buff_has_one_prediction_model_in_the_runtime(self):
         config = CONFIG_SOURCE.read_text(encoding="utf-8")
         source = FU_SOURCE.read_text(encoding="utf-8")
         runtime = RUNTIME_SOURCE.read_text(encoding="utf-8")
@@ -46,14 +61,15 @@ class FuFrameTimingTest(unittest.TestCase):
                 "buff_big_prediction_gate.hpp").read_text(encoding="utf-8")
 
         self.assertIn("buff_move_mode: small", config)
-        self.assertIn("buff_big_variable_speed_enabled: true", config)
-        self.assertIn("g_buff_big_variable_speed_enabled = true", source)
+        self.assertNotIn("buff_big_ransac_enabled:", config)
+        self.assertNotIn('#include "buff_motion_predictor.hpp"', source)
+        self.assertNotIn('#include "buff_big_variable_speed_predictor.hpp"', source)
         self.assertIn('param<std::string>("buff_move_mode"', source)
         self.assertIn('MoveMode == "big"', runtime)
-        self.assertIn("g_big_variable_speed_prediction_valid", runtime)
-        self.assertIn("variable_speed_update_ok", runtime)
-        self.assertIn("g_big_prediction_gate.update", runtime)
-        self.assertIn("g_big_prediction_gate.reject()", runtime)
+        self.assertIn("g_big_buff_predictor.update", runtime)
+        self.assertIn("g_big_buff_predictor.reject()", runtime)
+        self.assertNotIn("Predicted->predicted", runtime)
+        self.assertNotIn("default_omega", runtime)
         self.assertIn("kBigPredictionAcquireFrames = 3", gate)
         self.assertIn("g_buff_world_ekf_primary", runtime)
         self.assertNotIn("Prefer the Zhejiang University large-buff model", runtime)

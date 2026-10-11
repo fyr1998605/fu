@@ -67,28 +67,22 @@ buff_imu_stamp_offset_seconds: 0.0            # [同步] IMU 时间戳偏移(秒
 buff_radius_mm: 650.00                        # [尺寸] 能量机关半径(mm), 中心→装甲板距离
 buff_hub_normal_offset_mm: 0.0                # [尺寸] 中心hub法向偏移(mm), 一般=0
 
-# Buff motion model selection. The shared image/Kalman path remains the
-# startup and dropout fallback; big mode replaces only its phase extrapolation
-# with the variable-speed predictor after warm-up.
+# One prediction model per mode: small = pixel Kalman, big = RANSAC sine.
+# Warm-up or rejected observations produce no predicted aim point.
 buff_move_mode: small
-# small = current constant-speed image Kalman; big = shared image path with
-# variable-speed phase prediction after warm-up. Change only this value to
-# switch modes at launch.
 buff_target_priority: locked
 buff_target_lock_timeout_seconds: 0.25
-buff_big_variable_speed_enabled: true
-buff_big_ransac_enabled: false
+
+# Big-mode sine fitter: bounded to 300 speed observations, no alternate model.
 buff_big_ransac_max_iterations: 200
-buff_big_ransac_threshold: 0.5
-buff_big_ransac_min_omega: 1.884
-buff_big_ransac_max_omega: 2.0
-buff_big_ransac_min_amplitude: 0.780
-buff_big_ransac_max_amplitude: 1.045
-buff_big_ransac_min_inliers: 100
 buff_big_ransac_fit_every_n_samples: 5
-buff_big_ransac_max_abs_speed: 3.2
-buff_big_ransac_max_gap_seconds: 5.0
-buff_big_ransac_max_consecutive_rejections: 30
+buff_big_ransac_min_inliers: 100
+buff_big_ransac_threshold: 0.5
+
+# Set false for a run without GUI to isolate imshow/waitKey stalls.
+buff_show_image: true
+# [BUFF_TIMING] captures every frame and reports p99, max and its stage timings.
+buff_slow_frame_ms: 50.0
 
 # ============================================================
 #  观测噪声 R (Measurement Noise) —— "PnP 测量值有多不准?"

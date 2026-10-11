@@ -1,12 +1,10 @@
 #include "opencv2/opencv.hpp"
- #include <ceres/ceres.h>
  #include <Eigen/Dense>
  #include <cmath>
  #include <stdexcept>
  #include <random>
  #include <algorithm>
  #include <iostream>
- #include <fftw3.h>
  #include <fstream>
  #include <vector>
  #include <deque>
@@ -23,9 +21,8 @@
  #include "buff_recognizer.hpp"   // Buff识别器: YOLO11关键点模型
  #include "blade_tracker.hpp"     // Small-buff phase tracking and prediction
 #include "buff_world_tracker.hpp"
-#include "buff_big_ransac_predictor.hpp"
-#include "buff_big_variable_speed_predictor.hpp"
-#include "buff_big_prediction_gate.hpp"
+#include "buff_big_predictor.hpp"
+#include "buff_frame_timing.hpp"
  #include "CoorConverter.hpp"    // 坐标变换: 相机→IMU→枪管
  #include "rm_msgs/RmSerial.h"
 #include <std_msgs/Float64.h>
@@ -50,18 +47,17 @@ bool g_buff_world_ekf_enabled = false;
 bool g_buff_world_ekf_control_enabled = false;
 bool g_buff_world_ekf_primary = false;
 bool g_quaternion_is_imu_to_map = true;
-bool g_buff_big_ransac_enabled = true;
-bool g_buff_big_variable_speed_enabled = true;
+bool g_buff_show_image = true;
+double g_buff_slow_frame_ms = 50.0;
+BuffFrameTiming g_buff_frame_timing;
 
-// Persistent rotation direction shared across Kalman and fallback paths.
+// Rotation direction of the selected motion model.
 // +1 = polar angle increases over time (clockwise in OpenCV image space)
 // -1 = polar angle decreases over time
 //  0 = unknown / not yet determined
 int g_buff_rotation_sign = 0;
 double g_imu_stamp_offset_seconds = 0.0;
 
-// Persistent direction that survives Angleprocess re-creation (declared extern in buff_angle_processor.hpp)
-int g_persistent_rotation_dir = 0;
 double g_buff_target_width_mm = 300.0;
 double g_buff_target_height_mm = 300.0;
 // The Buff PnP calibration is independent from the cam2Imu/gun2Imu
@@ -89,8 +85,6 @@ ros::Time g_frame_image_stamp;
 double g_frame_monotonic_time_seconds = 0.0;
 std::uint64_t g_frame_sequence = 0;
 std::uint64_t g_processed_frame_sequence = 0;
-double g_last_big_buff_timestamp =
-    std::numeric_limits<double>::quiet_NaN();
 bool g_has_frame_imu_pose = false;
 double g_frame_imu_image_skew_seconds =
     std::numeric_limits<double>::quiet_NaN();
@@ -127,7 +121,7 @@ bool findClosestImuPose(const ros::Time& image_stamp, TimedImuPose& matched_pose
 // 模型路径+敌方颜色通过 ROS param: buff_model_path, enemy_color
 // 标签映射: enemy_color → enemy_class_idx_
 //   "blue" → 0 → tensor行4(class 0=red)  "red" → 1 → tensor行5(class 1=blue)
-// 结果流向: g_R_center/g_Fan_center→Fu_angleprocess, g_side→PnPSolver_gravity
+// 结果流向: g_R_center/g_Fan_center→所选运动模型, g_side→PnPSolver_gravity
 // 详细文档见 README_buff_upgrade.md
 BuffRecognizer* g_recognizer = nullptr;
 // 识别结果缓存
@@ -146,8 +140,6 @@ double fps = 30;
 
 
 
-#include "buff_motion_predictor.hpp"
-#include "buff_angle_processor.hpp"
 #include "buff_pnp_solver.hpp"
 
 //前处理
@@ -237,25 +229,14 @@ double pitch_compensation = -0.06;//pitch补偿
 double yaw_compensation = 0.02;//yaw补偿
 // double pitch_compensation = 0.0;//pitch补偿
 // double yaw_compensation = 0.0;//yaw补偿
-Fu_angleprocess* Angleprocess = nullptr;;//创建角度处理器
-buff_predicted* Predicted = nullptr;;//创建预测器
-buff_zju::BigBuffRansacPredictor* g_big_buff_predictor = nullptr;
-buff_zju::BigBuffVariableSpeedPredictor* g_big_variable_speed_predictor = nullptr;
-buff_zju::BigBuffPredictionGate g_big_prediction_gate;
-double g_big_variable_speed_prediction_lead = 0.0;
-bool g_big_variable_speed_prediction_valid = false;
+buff_zju::BigBuffPredictor g_big_buff_predictor;
 PnPSolver_gravity* pnpSolver_gravity = nullptr;;//创建重力补偿器
 CoordinateTransformer* g_coorConverter = nullptr;   //相机→枪管坐标变换
 SmallBuffPhaseTracker g_small_buff_tracker;
 
 //创建中间变量
-// Frame time shared by the legacy angle history and the large-buff predictor.
-double time_milliseconds = 0;//计时(单位毫秒)
-double angle_diff_temp = 0;//差分角度
-vector<double> angle_diff;//差分角度容器
-vector<double> angle_diff_time;//时间容器
-double predicted_diff_angle = 0;//预测差分角
-double final_angle = 0;//最终角度(原角度加上预测角)
+// Monotonic time of the current image, in milliseconds.
+double time_milliseconds = 0;
 cv::Point2f final_angle_2D = {0, 0};//最终角度对应的图像点
 cv::Point2f euler_angles = {0, 0};//储存发送的空间角
 
@@ -291,13 +272,15 @@ int main(int argc, char *argv[])
                                   buff_target_priority, "locked");
     private_nh.param<double>("buff_target_lock_timeout_seconds",
                              buff_target_lock_timeout_seconds, 0.25);
-    private_nh.param<bool>("buff_big_ransac_enabled", g_buff_big_ransac_enabled, true);
-    private_nh.param<bool>("buff_big_variable_speed_enabled",
-                           g_buff_big_variable_speed_enabled, true);
+    private_nh.param<bool>("buff_show_image", g_buff_show_image, true);
+    private_nh.param<double>("buff_slow_frame_ms", g_buff_slow_frame_ms, 50.0);
+    if (!std::isfinite(g_buff_slow_frame_ms) || g_buff_slow_frame_ms <= 0.0) {
+        g_buff_slow_frame_ms = 50.0;
+    }
     private_nh.param<std::string>("buff_move_mode", MoveMode, MoveMode);
     if (MoveMode != "small" && MoveMode != "big") {
-        ROS_WARN("[Fu] Unsupported buff_move_mode='%s', fallback to small", MoveMode.c_str());
-        MoveMode = "small";
+        ROS_FATAL("[Fu] Unsupported buff_move_mode='%s'; choose small or big", MoveMode.c_str());
+        return 1;
     }
 
     private_nh.param<bool>("buff_world_ekf_enabled", g_buff_world_ekf_enabled, false);//是否启用世界帧跟踪器
@@ -310,11 +293,6 @@ int main(int argc, char *argv[])
                            g_quaternion_is_imu_to_map, true);
     private_nh.param<double>("buff_imu_stamp_offset_seconds",
                              g_imu_stamp_offset_seconds, 0.0);
-
-    if (g_buff_big_variable_speed_enabled) {
-        g_big_variable_speed_predictor =
-            new buff_zju::BigBuffVariableSpeedPredictor();
-    }
 
     // ═══ 时间补偿参数(提前量 = 飞行时间 + 视觉链路延迟 + 电控延时) ═══
     private_nh.param<double>("buff_vision_delay_seconds",
@@ -361,75 +339,45 @@ int main(int argc, char *argv[])
         buff_hub_normal_offset_mm * 0.001;
     g_buff_world_tracker.configure(g_buff_world_config);
 
-    const bool big_ransac_active = buff_zju::is_big_buff_ransac_active(
-        g_buff_big_ransac_enabled, MoveMode);
-    if (big_ransac_active) {
-        buff_zju::BigBuffRansacConfig big_ransac_config;
-        private_nh.param<int>(
-            "buff_big_ransac_max_iterations",
-            big_ransac_config.ransac.max_iterations,
-            big_ransac_config.ransac.max_iterations);
-        private_nh.param<double>(
-            "buff_big_ransac_threshold",
-            big_ransac_config.ransac.threshold,
-            big_ransac_config.ransac.threshold);
-        private_nh.param<double>(
-            "buff_big_ransac_min_omega",
-            big_ransac_config.ransac.min_omega,
-            big_ransac_config.ransac.min_omega);
-        private_nh.param<double>(
-            "buff_big_ransac_max_omega",
-            big_ransac_config.ransac.max_omega,
-            big_ransac_config.ransac.max_omega);
-        private_nh.param<double>(
-            "buff_big_ransac_min_amplitude",
-            big_ransac_config.ransac.min_amplitude,
-            big_ransac_config.ransac.min_amplitude);
-        private_nh.param<double>(
-            "buff_big_ransac_max_amplitude",
-            big_ransac_config.ransac.max_amplitude,
-            big_ransac_config.ransac.max_amplitude);
-        private_nh.param<int>(
-            "buff_big_ransac_min_inliers",
-            big_ransac_config.min_inliers,
-            big_ransac_config.min_inliers);
-        private_nh.param<int>(
-            "buff_big_ransac_fit_every_n_samples",
-            big_ransac_config.fit_every_n_samples,
-            big_ransac_config.fit_every_n_samples);
-        private_nh.param<double>(
-            "buff_big_ransac_max_abs_speed",
-            big_ransac_config.max_abs_speed,
-            big_ransac_config.max_abs_speed);
-        private_nh.param<double>(
-            "buff_big_ransac_max_gap_seconds",
-            big_ransac_config.max_gap_seconds,
-            big_ransac_config.max_gap_seconds);
-        private_nh.param<int>(
-            "buff_big_ransac_max_consecutive_rejections",
-            big_ransac_config.max_consecutive_rejections,
-            big_ransac_config.max_consecutive_rejections);
-        // 参数清洗：非有限/越界值回落到默认值，保证 predictor 与 fitter 使用
-        // 同一套规则（构造前完成清洗，避免两套 max_gap 规则不一致）
-        const buff_zju::BigBuffRansacConfig sanitized_cfg =
-            buff_zju::sanitize_big_buff_ransac_config(big_ransac_config);
-        if (sanitized_cfg != big_ransac_config) {
-            ROS_WARN("[Fu] buff_big_ransac_* params sanitized (non-finite or out-of-range values replaced by defaults)");
-        }
-        g_big_buff_predictor = new buff_zju::BigBuffRansacPredictor(sanitized_cfg);
-        ROS_INFO(
-            "[Fu] ZJU big-buff RANSAC enabled: omega=[%.3f, %.3f], min_inliers=%d, max_rejections=%d",
-            sanitized_cfg.ransac.min_omega,
-            sanitized_cfg.ransac.max_omega,
-            sanitized_cfg.min_inliers,
-            sanitized_cfg.max_consecutive_rejections);
+    if (MoveMode == "big") {
+        buff_zju::BigBuffRansacConfig config;
+        private_nh.param<int>("buff_big_ransac_max_iterations",
+                             config.ransac.max_iterations, config.ransac.max_iterations);
+        private_nh.param<double>("buff_big_ransac_threshold",
+                                config.ransac.threshold, config.ransac.threshold);
+        private_nh.param<double>("buff_big_ransac_min_omega",
+                                config.ransac.min_omega, config.ransac.min_omega);
+        private_nh.param<double>("buff_big_ransac_max_omega",
+                                config.ransac.max_omega, config.ransac.max_omega);
+        private_nh.param<double>("buff_big_ransac_min_amplitude",
+                                config.ransac.min_amplitude, config.ransac.min_amplitude);
+        private_nh.param<double>("buff_big_ransac_max_amplitude",
+                                config.ransac.max_amplitude, config.ransac.max_amplitude);
+        private_nh.param<int>("buff_big_ransac_min_inliers",
+                             config.min_inliers, config.min_inliers);
+        private_nh.param<int>("buff_big_ransac_fit_every_n_samples",
+                             config.fit_every_n_samples, config.fit_every_n_samples);
+        private_nh.param<double>("buff_big_ransac_max_abs_speed",
+                                config.max_abs_speed, config.max_abs_speed);
+        private_nh.param<double>("buff_big_ransac_max_gap_seconds",
+                                config.max_gap_seconds, config.max_gap_seconds);
+        private_nh.param<int>("buff_big_ransac_max_consecutive_rejections",
+                             config.max_consecutive_rejections,
+                             config.max_consecutive_rejections);
+        const auto sanitized = buff_zju::sanitize_big_buff_ransac_config(config);
+        if (sanitized != config) ROS_WARN("[Fu] Invalid RANSAC parameters replaced by validated values");
+        g_big_buff_predictor.configure(sanitized);
+        ROS_INFO("[Fu] Big sine model: iterations=%d fit_every=%d min_inliers=%d threshold=%.3f",
+                 sanitized.ransac.max_iterations, sanitized.fit_every_n_samples,
+                 sanitized.min_inliers, sanitized.ransac.threshold);
     }
-
-    ROS_INFO("[Fu] Buff mode: %s, variable-speed primary: %s, ZJU big-buff RANSAC: %s",
-             MoveMode.c_str(),
-             (MoveMode == "big" && g_buff_big_variable_speed_enabled)
-                 ? "active" : "inactive",
-             big_ransac_active ? "active" : "inactive");
+    if (private_nh.hasParam("buff_big_ransac_enabled") ||
+        private_nh.hasParam("buff_big_variable_speed_enabled")) {
+        ROS_WARN("[Fu] Legacy predictor enable flags are ignored; buff_move_mode selects one model: small=pixel Kalman, big=RANSAC sine");
+    }
+    ROS_INFO("[Fu] Buff mode: %s, predictor: %s, display: %s",
+             MoveMode.c_str(), MoveMode == "big" ? "RANSAC sine" : "pixel Kalman",
+             g_buff_show_image ? "enabled" : "disabled");
     ROS_INFO("[Fu] Buff model: %s", buff_model_path.c_str());
     ROS_INFO("[Fu] Enemy color: %s", enemy_color.c_str());
     ROS_INFO("[Fu] World EKF: %s, control: %s, primary: %s, q IMU->map: %s, target: %.1f x %.1f mm",
@@ -479,44 +427,82 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    BuffTimingWindow timing_window(g_buff_slow_frame_ms);
+    auto last_timing_report = std::chrono::steady_clock::now();
     while (ros::ok())
     {
-        // // ROS_INFO("循环正在进行中");
-        // // cout<<"fu_task"<<endl;   
-                ros::spinOnce(); 
-        // cout << "11111111111111111111111111111111111111111111111111" << endl;
-        
-        //校正云台原始角度，封装后分两路发布：
-        //一路单独输出俯仰、偏航用于调试观测，一路下发完整三轴角度给电控控制云台追踪目标。
-        if(!Fu_Task()){
-            // 跟踪失败时的保底: 仅在打符模式下发布回传角度
-            // 装甲模式下不发布, 由 Tracker 节点通过 /auto_angle 负责
-            if(functional){
-                Angle.x = -RmSerialData.Pitch; // 保底: 发送平台pitch反号
+        const auto loop_start = std::chrono::steady_clock::now();
+        g_buff_frame_timing = BuffFrameTiming{};
+        {
+            BuffStageTimer callbacks(g_buff_frame_timing, BuffTimingStage::Callbacks);
+            ros::spinOnce();
+        }
+        const bool fresh_frame = g_frame_sequence != 0 &&
+            g_frame_sequence != g_processed_frame_sequence;
+        if (fresh_frame) {
+            g_buff_frame_timing.sequence = g_frame_sequence;
+            // Process, draw and publish only once for each received image.
+            if (!Fu_Task() && functional) {
+                BuffStageTimer output(g_buff_frame_timing, BuffTimingStage::Output);
+                Angle.x = -RmSerialData.Pitch;
                 Angle.y = RmSerialData.Yaw;
                 Angle.z = 1;
-                std_msgs::Float64 debug_msg_x;
-                std_msgs::Float64 debug_msg_y;
-                debug_msg_x.data = Angle.x;              // 期望角pitch
-                debug_msg_y.data = -RmSerialData.Pitch;   // 平提出轴角度
+                std_msgs::Float64 debug_msg_x, debug_msg_y;
+                debug_msg_x.data = Angle.x;
+                debug_msg_y.data = -RmSerialData.Pitch;
                 debugpub.publish(debug_msg_x);
                 debugpub1.publish(debug_msg_y);
                 PubAngle.publish(Angle);
             }
         }
 
-
-        if (!frame.empty()) {
-            imshow("Image with Point", frame);
-            if (cv::waitKey(1) == 'q') {
-                return 0; // 按'q'键退出
-            }
-        }else{
-            // cout<<"fu_task222222"<<endl; 
+        if (g_buff_show_image && !frame.empty()) {
+            BuffStageTimer display(g_buff_frame_timing, BuffTimingStage::Display);
+            if (fresh_frame) cv::imshow("Image with Point", frame);
+            if (cv::waitKey(1) == 'q') return 0;
         }
-        // ros::spinOnce();
-        
+
+        const auto loop_end = std::chrono::steady_clock::now();
+        g_buff_frame_timing.total_ms =
+            std::chrono::duration<double, std::milli>(loop_end - loop_start).count();
+        // Also retain slow callback/UI iterations without a new image.
+        if (fresh_frame || g_buff_frame_timing.total_ms >= g_buff_slow_frame_ms) {
+            timing_window.add(g_buff_frame_timing);
+        }
+        if (std::chrono::duration<double>(loop_end - last_timing_report).count() >= 1.0) {
+            const auto summary = timing_window.take();
+            const auto& worst = summary.worst;
+            if (summary.frames != 0) {
+                const auto log_start = std::chrono::steady_clock::now();
+                ROS_INFO(
+                    "[BUFF_TIMING] samples=%zu slow=%zu p99=%.1fms max=%.1fms frame=%llu "
+                    "arrival_gap_max=%.1fms capture_gap_max=%.1fms age=%.1fms "
+                    "worst(callbacks=%.1f copy=%.1f init=%.1f identify=%.1f observe=%.1f "
+                    "predict=%.1f solve=%.1f output=%.1f draw=%.1f display=%.1f log=%.1f)ms",
+                    summary.frames, summary.slow_frames, summary.p99_ms, worst.total_ms,
+                    static_cast<unsigned long long>(worst.sequence),
+                    summary.max_arrival_gap_ms, summary.max_capture_gap_ms, worst.image_age_ms,
+                    worst.stage(BuffTimingStage::Callbacks), worst.stage(BuffTimingStage::Copy),
+                    worst.stage(BuffTimingStage::Initialize), worst.stage(BuffTimingStage::Identify),
+                    worst.stage(BuffTimingStage::Observe), worst.stage(BuffTimingStage::Predict),
+                    worst.stage(BuffTimingStage::Solve), worst.stage(BuffTimingStage::Output),
+                    worst.stage(BuffTimingStage::Draw), worst.stage(BuffTimingStage::Display),
+                    worst.stage(BuffTimingStage::Diagnostics));
+                const double log_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - log_start).count();
+                if (log_ms >= g_buff_slow_frame_ms) {
+                    BuffFrameTiming log_event;
+                    log_event.total_ms = log_ms;
+                    log_event.ms[static_cast<std::size_t>(BuffTimingStage::Diagnostics)] = log_ms;
+                    timing_window.add(log_event); // Report a blocked diagnostic write next time.
+                }
+            }
+            last_timing_report = loop_end;
+        }
+        if (!fresh_frame && (!g_buff_show_image || frame.empty())) {
+            ros::WallDuration(0.001).sleep();
+        }
     }
-    
+
     return 0;
 }

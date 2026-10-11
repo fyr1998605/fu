@@ -26,9 +26,8 @@ inline bool bigPredictionAgreesWithPrimary(const double primary_angle,
         kBigPredictionMaxDisagreementRadians;
 }
 
-// Require consecutive valid predictions before the variable-speed model can
-// take over. A bad update or invalid projected point resets the streak and
-// immediately returns control to the stable primary path.
+// Require consecutive valid predictions before accepting the model output.
+// A bad update or invalid projected point resets the acquisition streak.
 class BigBuffPredictionGate {
 public:
     bool update(const bool prediction_valid) {
@@ -43,7 +42,7 @@ public:
         return active_;
     }
 
-    // Validate the variable-speed model's lead before it is added to the
+    // Validate the selected model's lead before it is added to the
     // current bright-blade angle. The lead must remain physically bounded,
     // keep the established rotation direction, and change continuously.
     bool updateLead(const bool prediction_valid,

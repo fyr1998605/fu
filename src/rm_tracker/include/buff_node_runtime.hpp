@@ -6,27 +6,10 @@
 #include <chrono>
 #include <limits>
 
-#include "buff_big_ransac_predictor.hpp"
-#include "buff_big_variable_speed_predictor.hpp"
-#include "buff_big_prediction_gate.hpp"
+#include "buff_big_predictor.hpp"
+#include "buff_frame_timing.hpp"
 
-extern int g_buff_rotation_sign;
-extern bool g_buff_world_ekf_primary;
-
-extern int g_persistent_rotation_dir;
-extern bool g_buff_big_ransac_enabled;
-extern buff_zju::BigBuffRansacPredictor* g_big_buff_predictor;
-extern buff_zju::BigBuffVariableSpeedPredictor* g_big_variable_speed_predictor;
-extern buff_zju::BigBuffPredictionGate g_big_prediction_gate;
-extern bool g_buff_big_variable_speed_enabled;
-extern double g_big_variable_speed_prediction_lead;
-extern bool g_big_variable_speed_prediction_valid;
-extern std::string MoveMode;
-extern std::uint64_t g_frame_sequence;
-extern std::uint64_t g_processed_frame_sequence;
-extern double g_frame_monotonic_time_seconds;
-extern double g_last_big_buff_timestamp;
-// Buff serial/image callbacks and Fu_Task extracted from Fu.cpp without logic changes.
+// Buff callbacks and per-frame detection, prediction and PnP processing.
 
 void doserial(const rm_msgs::RmSerialConstPtr serail)
 {
@@ -62,20 +45,10 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
         ROS_WARN_THROTTLE(2.0, "[Fu] 未知 ShootFlag='%c', 默认休眠", serail->ShootFlag);
         functional = false;
     }
-    if (functional != previous_functional && g_big_buff_predictor != nullptr) {
-        // A stop/start command starts a new observation session. Do not mix
-        // the previous roll/velocity window with the next activation after a
-        // potentially long pause, even when the camera clock is continuous.
-        g_big_buff_predictor->reset();
-        g_last_big_buff_timestamp =
-            std::numeric_limits<double>::quiet_NaN();
-    }
-    if (functional != previous_functional &&
-        g_big_variable_speed_predictor != nullptr) {
-        g_big_variable_speed_predictor->reset();
-        g_big_prediction_gate.reject();
-        g_big_variable_speed_prediction_valid = false;
-        g_big_variable_speed_prediction_lead = 0.0;
+    if (functional != previous_functional) {
+        g_big_buff_predictor.reset();
+        g_small_buff_tracker.reset();
+        g_buff_rotation_sign = 0;
     }
     if(serail->Camp=='b')
     {
@@ -99,7 +72,29 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
     void doimage(const sensor_msgs::ImageConstPtr img)
     {
         const auto frame_received_at = std::chrono::steady_clock::now();
+        static double previous_arrival_seconds = 0.0;
+        const double arrival_seconds = std::chrono::duration<double>(
+            frame_received_at.time_since_epoch()).count();
+        if (previous_arrival_seconds > 0.0) {
+            g_buff_frame_timing.arrival_gap_ms = std::max(
+                g_buff_frame_timing.arrival_gap_ms,
+                (arrival_seconds - previous_arrival_seconds) * 1000.0);
+        }
+        previous_arrival_seconds = arrival_seconds;
+        if (!g_frame_image_stamp.isZero() && !img->header.stamp.isZero()) {
+            g_buff_frame_timing.capture_gap_ms = std::max(
+                g_buff_frame_timing.capture_gap_ms,
+                (img->header.stamp - g_frame_image_stamp).toSec() * 1000.0);
+        }
+        if (!img->header.stamp.isZero()) {
+            const double age_ms = (ros::Time::now() - img->header.stamp).toSec() * 1000.0;
+            if (std::isfinite(age_ms) && age_ms >= 0.0) {
+                g_buff_frame_timing.image_age_ms = age_ms;
+            }
+        }
         cv_bridge::CvImagePtr cv_ptr; // 声明一个CvImage指针的实例
+        {
+        BuffStageTimer copy(g_buff_frame_timing, BuffTimingStage::Copy);
         try
         //try{}：异常监测代码块，包裹图像转换逻辑，捕捉转换时出现的错误。
         {
@@ -112,7 +107,8 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
 
             return;
         }
-        frame_ = cv_ptr->image.clone();//将OpenCV图像复制给frame_，避免直接操作ROS图像
+        frame_ = cv_ptr->image; // toCvCopy already owns this image buffer.
+        }
 
         g_frame_image_stamp = img->header.stamp;//记录当前图像的时间戳
         g_frame_monotonic_time_seconds = std::chrono::duration<double>(
@@ -152,33 +148,21 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
     //相机异常时释放内存、重置全局参数，避免程序崩溃。
     bool Fu_Task()
     {
-    	// Sync persistent direction to global before any processing.
-    	// Ensures g_buff_rotation_sign is valid even when Kalman diverges
-    	// and the angle processor has not yet accumulated 21 frames.
-    	if (g_persistent_rotation_dir != 0) {
-    		g_buff_rotation_sign = g_persistent_rotation_dir;
-    	}
-        static cv::Point2f smooth_R = g_R_center;
-    static cv::Point2f smooth_Fan = g_Fan_center;
-    float alpha = 0.3; // 越小越平滑
-    smooth_R = smooth_R * (1 - alpha) + g_R_center * alpha;
-    smooth_Fan = smooth_Fan * (1 - alpha) + g_Fan_center * alpha;
-    frame = frame_.clone();//将frame_复制给frame，避免直接操作frame_
-    // cout<<"testtest"<<endl;
-    //functional 全局标记：true = 相机正常输出图像；false = 断流 / 打不开摄像头；
-    if(functional)
-    {
-        if(frame.empty()){
-            return false;
-        }
-        // The main loop can run faster than the image callback. Consume each
-        // image sequence exactly once so processing jitter is never used as a
-        // motion timestamp and the same detection is not fitted repeatedly.
         if (g_frame_sequence == 0 ||
             g_frame_sequence == g_processed_frame_sequence) {
             return false;
         }
         g_processed_frame_sequence = g_frame_sequence;
+        {
+            BuffStageTimer copy(g_buff_frame_timing, BuffTimingStage::Copy);
+            frame = frame_.clone(); // Drawing owns its buffer; copy each image once.
+        }
+    // functional is selected by the serial command, independently of image arrival.
+    if(functional)
+    {
+        if(frame.empty()){
+            return false;
+        }
         // Feed gimbal feedback only to the big-buff path. The recognizer's
         // compensated pixel gate is shared with ordinary candidate selection,
         // so keeping this disabled in small mode preserves its old behavior.
@@ -194,6 +178,7 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
 
     if (!init)
     {
+        BuffStageTimer initialization(g_buff_frame_timing, BuffTimingStage::Initialize);
         // ═══ 首帧初始化: ①识别 ②建模块 ③算飞行时间 ═══
         //
         // ① BuffRecognizer::init(): YOLO推理→remap 9→6→R中心精化→输出坐标
@@ -216,19 +201,7 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
                  (int)init_R.x, (int)init_R.y, (int)init_Fan.x, (int)init_Fan.y, init_side);
 
         // ②③ 创建下游处理模块
-        Angleprocess = new Fu_angleprocess();        // 角度处理器: 极坐标+累加+差分
-        Predicted = new buff_predicted();            // 预测器: FFT频率+正弦拟合+滑动平均
-        if (g_big_buff_predictor != nullptr) {
-            g_big_buff_predictor->reset();
-            g_last_big_buff_timestamp =
-                std::numeric_limits<double>::quiet_NaN();
-        }
-        if (g_big_variable_speed_predictor != nullptr) {
-            g_big_variable_speed_predictor->reset();
-        }
-        g_big_prediction_gate.reject();
-        g_big_variable_speed_prediction_valid = false;
-        g_big_variable_speed_prediction_lead = 0.0;
+        g_big_buff_predictor.reset();
         pnpSolver_gravity = new PnPSolver_gravity(
             g_buff_target_width_mm, g_buff_target_height_mm,
             g_buff_camera_matrix, g_buff_dist_coeffs);//创建PnP解算器，初始化相机参数，返回是否成功
@@ -246,16 +219,10 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
 
         }else{
             ROS_WARN("[Fu] 时间初始化失败!");
-            delete Angleprocess; Angleprocess = nullptr;
-            delete Predicted; Predicted = nullptr;
             delete pnpSolver_gravity; pnpSolver_gravity = nullptr;
             return false;
         }
 
-        angle_diff.clear();//差分角度容器
-        angle_diff_time.clear();//时间容器
-        predicted_diff_angle = 0;//预测差分角
-        final_angle = 0;//最终角度(原角度加上预测角)
         final_angle_2D = {0, 0};//最终角度对应的图像点
         euler_angles = {0, 0};//储存发送的空间角
 
@@ -269,34 +236,38 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
     //time_milliseconds = 1/fps__*1000+time_milliseconds;
     //cout << "时间：" << time_milliseconds << endl;
 
-    std::chrono::steady_clock::time_point Identifies_start = std::chrono::steady_clock::now();
-
     // ═══ 逐帧识别: BuffRecognizer::identify() ═══
     // 内部7步: ①YOLO推理→②remap 9→6→③R中心精化→④扇叶中心→⑤边长→⑥PnP角点→⑦时序校验
     // 模型: YOLO11-pose, OpenVINO CPU, 输入[1,3,640,640], 输出[1,33,8400]
     // 标签: class_row=4+enemy_class_idx_ (0→行4=red, 1→行5=blue)
-    // 输出: g_R_center/g_Fan_center→Fu_angleprocess, g_side→PnPSolver_gravity
+    // 输出: g_R_center/g_Fan_center→所选运动模型, g_side→PnPSolver_gravity
+    {
+    BuffStageTimer identify(g_buff_frame_timing, BuffTimingStage::Identify);
     if (!g_recognizer->identify(frame, g_R_center, g_Fan_center, g_side, g_corners))//识别目标，返回是否成功
 
     {
         ROS_DEBUG("[Fu] 识别失败");
+        g_big_buff_predictor.reject();
         return false;   // 检测失败 → 无目标, 不画图
     }
 // cout << "22222222222222222222777777" << endl;
+    }
     // ★ 识别成功后无论下游是否失败, 都先画检测框再跑跟踪链
     // 下游失败时只画检测, 不发布角度 (track_ok = false)
     bool track_ok = false;
 
     // Debug only: use this frame's measured keypoints, not the predicted point.
-    pnpSolver_gravity->logObservedPnP(
-        g_corners[0], g_corners[1], g_corners[2], g_corners[3]);//记录当前帧的PnP角点
-//  cout << "9999999999999999" << endl;
-
     bool world_observation_ready = false;  // 世界帧观测是否准备就绪
     bool has_world_reproj = false;                  // 是否有有效的世界卡尔曼重投影
     double world_reproj_error = 0.0;                // 重投影误差(px)
     cv::Point2d world_kalman_reproj_pixel;           // 世界卡尔曼重投影像素
     cv::Point2d world_measured_reproj_pixel;         // 世界观测重投影像素
+
+    {
+    BuffStageTimer observation(g_buff_frame_timing, BuffTimingStage::Observe);
+    pnpSolver_gravity->logObservedPnP(
+        g_corners[0], g_corners[1], g_corners[2], g_corners[3]);//记录当前帧的PnP角点
+//  cout << "9999999999999999" << endl;
 
     if (g_buff_world_ekf_enabled) {//如果世界帧跟踪器已启用
     // cout << "3333333333333333333337" << endl;
@@ -365,260 +336,65 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
         }
     }
 
-    // --- Small-buff tracking and prediction ---
-    // This remains the default control path until the world tracker is enabled
-    // and has received enough valid world-frame observations.
-   // ═══════════════════════════════════════════════════════════════
-      // 混合预测: 卡尔曼(主) + 角度差分线性外推(兜底)
-      // ═══════════════════════════════════════════════════════════════
+    } // observation timing
 
-      // ---- Step 1: 每帧喂 Angleprocess，保持角度缓存始终热 ----
-      // 这一步无论卡尔曼是否正常都会执行，确保切兜底时不需要预热
-      {
-          static double fallback_fps = 120.0;  // 运行中 EMA 估计
-          static double last_frame_time_seconds =
-              std::numeric_limits<double>::quiet_NaN();
-          const double frame_time_seconds = g_frame_monotonic_time_seconds;
-          const double frame_interval_seconds =
-              frame_time_seconds - last_frame_time_seconds;
-          last_frame_time_seconds = frame_time_seconds;
-          if (std::isfinite(frame_interval_seconds) &&
-              frame_interval_seconds > 1e-4 && frame_interval_seconds < 0.5) {
-              fallback_fps = 0.9 * fallback_fps +
-                  0.1 * (1.0 / frame_interval_seconds);
-          }
-
-          Angleprocess->set_image_size(frame.cols, frame.rows);
-          double angle_diff_temp = Angleprocess->pre_predict_angle_process(
-              g_R_center, g_Fan_center, time_milliseconds, delta_t_,
-  fallback_fps);
-          // RANSAC 采样与旧角度差分解耦：只要本帧极角新鲜（图幅内）就喂给
-          // RANSAC，不再依赖旧差分算法返回有效值（旧算法首帧/丢帧/扇叶跳变会返回 -1）
-          if (buff_zju::is_big_buff_ransac_active(
-                  g_buff_big_ransac_enabled, MoveMode) &&
-              g_big_buff_predictor != nullptr &&
-              Angleprocess->last_frame_polar_valid) {
-              if (Angleprocess->anticlockwise_flag) {
-                  g_buff_rotation_sign = Angleprocess->anticlockwise ? 1 : -1;
-              }
-              g_big_buff_predictor->set_rotation_sign(g_buff_rotation_sign);
-              const double predictor_timestamp =
-                  g_frame_monotonic_time_seconds;
-              if (std::isfinite(predictor_timestamp)) {
-                  const bool timestamp_repeated =
-                      std::isfinite(g_last_big_buff_timestamp) &&
-                      predictor_timestamp == g_last_big_buff_timestamp;
-                  if (std::isfinite(g_last_big_buff_timestamp) &&
-                      predictor_timestamp < g_last_big_buff_timestamp) {
-                      // A clock reset cannot be mixed into the existing fit window.
-                      g_big_buff_predictor->reset();
-                  }
-                  if (!timestamp_repeated) {
-                      g_big_buff_predictor->update_polar(
-                          predictor_timestamp,
-                          static_cast<double>(Angleprocess->angle_polar_now));
-                      g_last_big_buff_timestamp = predictor_timestamp;
-                  }
-              }
-          }
-          if (MoveMode == "big" && g_buff_big_variable_speed_enabled &&
-              g_big_variable_speed_predictor != nullptr &&
-              Angleprocess->last_frame_polar_valid) {
-              double variable_speed_prediction = 0.0;
-              const bool variable_speed_update_ok =
-                  g_big_variable_speed_predictor->update(
-                  g_frame_monotonic_time_seconds,
-                  static_cast<double>(Angleprocess->angle_polar_now),
-                  delta_t_, variable_speed_prediction);
-              if (variable_speed_update_ok &&
-                  std::isfinite(variable_speed_prediction)) {
-                  // The result is consumed after the shared small-buff path
-                  // below. Until the variable-speed model has ten samples,
-                  // the small-buff Kalman remains the safe fallback.
-                  g_big_variable_speed_prediction_lead =
-                      g_big_variable_speed_predictor->prediction_lead(delta_t_);
-                  g_big_variable_speed_prediction_valid =
-                      g_big_variable_speed_predictor->ready() &&
-                      std::isfinite(g_big_variable_speed_prediction_lead);
-              } else {
-                  g_big_variable_speed_prediction_valid = false;
-                  g_big_variable_speed_prediction_lead = 0.0;
-              }
-          } else {
-              g_big_variable_speed_prediction_valid = false;
-              g_big_variable_speed_prediction_lead = 0.0;
-          }
-          if (angle_diff_temp != -1) {
-             angle_diff_temp = std::remainder(angle_diff_temp, 2.0 * CV_PI);
-				// Update global rotation direction from angle processor
-				if (Angleprocess->anticlockwise_flag) {
-					g_buff_rotation_sign = Angleprocess->anticlockwise ? 1 : -1;
-				}
-              angle_diff.push_back(angle_diff_temp);
-              angle_diff_time.push_back(time_milliseconds);
-              // 限制缓存长度，防止无限增长
-              while (angle_diff.size() > 300) {
-                  angle_diff.erase(angle_diff.begin());
-                  angle_diff_time.erase(angle_diff_time.begin());
-              }
-          }
-      }
-
-      // ---- Step 2: 卡尔曼主路径 (原逻辑) ----
-      const bool pixel_track_ok = g_small_buff_tracker.update(
-          g_R_center,
-          g_Fan_center,
-          time_milliseconds * 0.001,
-          delta_t_,
-          final_angle_2D);
-
-      // ---- Step 3: 发散检测 ----
-      // 卡尔曼输出的预测点必须满足:
-      //   (a) 坐标有限
-      //   (b) 到圆心的距离在 [0.4×半径, 2.5×半径] 之间
-      // 如果连续3帧不满足，判定卡尔曼发散
-      bool kalman_healthy = pixel_track_ok;
-		// Update global rotation direction from Kalman tracker
-		if (g_small_buff_tracker.lockedDirection() != 0) {
-			g_buff_rotation_sign = g_small_buff_tracker.lockedDirection();
-		}
-      static int kalman_bad_frames = 0;
-
-      if (kalman_healthy && Angleprocess->radius_buff > 1.0f) {
-          float pred_dist = cv::norm(final_angle_2D - g_R_center);
-          if (pred_dist < 0.3f * Angleprocess->radius_buff ||
-              pred_dist > 3.5f * Angleprocess->radius_buff ||
-              !std::isfinite(final_angle_2D.x) ||
-  !std::isfinite(final_angle_2D.y)) {
-              kalman_healthy = false;
-          }
-      }
-
-      kalman_healthy ? kalman_bad_frames = 0 : kalman_bad_frames++;
-
-      // ---- Step 4: 决策 ----
-      static bool using_fallback = false;
-      static int  fallback_fail_cnt = 0;
-
-      if (kalman_healthy) {
-          // ── 卡尔曼正常 ──
-          track_ok = true;
-          if (using_fallback) {
-              ROS_INFO("[Fu] Kalman recovered, back to primary path");
-              using_fallback = false;
-              fallback_fail_cnt = 0;
-          }
-      } else if (kalman_bad_frames >= 4 && Angleprocess != nullptr && Predicted
-  != nullptr) {
-          // ── 卡尔曼已连续异常 ≥3 帧，启用兜底 ──
-          if (!using_fallback) {
-             ROS_WARN("[Fu] Kalman diverged (bad=%d frames), fallback to angle-diff", kalman_bad_frames);
-              using_fallback = true;
-          }
-
-          // ★ 核心兜底逻辑 ★
-          // predicted_diff_angle = 过去 delta_t 秒内转过的角度 (EMA平滑)
-          // final_angle = 当前极角 + 预测提前量
-          // final_angle_2D = 极坐标 → 像素坐标
-          static std::string fallback_mode = MoveMode;
-        //   angle_diff = std::remainder(angle_diff, 2.0 * CV_PI); // 角度归一化
-          predicted_diff_angle = Predicted->predicted(
-              angle_diff, angle_diff_time, fallback_mode, delta_t_,
-              /* fps 用 EMA 估计值 */ (angle_diff_time.size() > 1)
-                  ? 1000.0 * angle_diff_time.size() /
-                        (angle_diff_time.back() - angle_diff_time.front())
-                  : 120.0);
-
-          if (predicted_diff_angle != 0.0) {
-              final_angle = predicted_diff_angle +
-  Angleprocess->angle_polar_now;
-  
-
-       final_angle = std::remainder(final_angle, 2.0 * CV_PI);// 角度归一化
-              final_angle_2D = Angleprocess->post_predict_angle_process(
-                  final_angle, Angleprocess->radius_buff);
-              track_ok = true;
-              fallback_fail_cnt = 0;
-          } else {
-              // Last resort: use persistent direction for constant-speed prediction.
-              if (g_buff_rotation_sign != 0 && Angleprocess != nullptr) {
-              	const double default_omega = 1.047;  // 60 deg/s default
-              	const double sign = g_buff_rotation_sign > 0 ? 1.0 : -1.0;
-              	predicted_diff_angle = sign * default_omega * delta_t_;
-              	final_angle = predicted_diff_angle + Angleprocess->angle_polar_now;
-              	final_angle = std::remainder(final_angle, 2.0 * CV_PI);
-              	final_angle_2D = Angleprocess->post_predict_angle_process(
-              	    final_angle, Angleprocess->radius_buff);
-              	track_ok = true;
-              	fallback_fail_cnt = 0;
-              } else {
-              	track_ok = false;
-              	fallback_fail_cnt++;
-              }
-          }
-      } else {
-          // ── 卡尔曼异常但还没攒够 3 帧，或兜底对象为空 ──
-          track_ok = false;
-      }
-
-
-    // Big mode shares the small-buff observation/validation/output path, but
-    // replaces its constant-speed phase extrapolation with the variable-speed
-    // phase model after ten valid samples and phase-agreement gating. The small-buff Kalman remains the
-    // startup/dropout fallback so mode switching cannot create a dead period.
-    if (MoveMode == "big" && g_big_variable_speed_prediction_valid &&
-        pixel_track_ok && kalman_healthy &&
-        Angleprocess->radius_buff > 1.0f) {
-        const double predicted_roll = buff_zju::bigBuffPredictionAngle(
-            static_cast<double>(Angleprocess->angle_polar_now),
-            g_big_variable_speed_prediction_lead);
-        const cv::Point2f zju_predicted_point =
-            Angleprocess->post_predict_angle_process(
-                predicted_roll, Angleprocess->radius_buff);
-        const bool finite_point =
-            std::isfinite(zju_predicted_point.x) &&
-            std::isfinite(zju_predicted_point.y);
-        const bool inside_frame =
-            finite_point && zju_predicted_point.x > 0.0f &&
-            zju_predicted_point.x <= static_cast<float>(frame.cols) &&
-            zju_predicted_point.y > 0.0f &&
-            zju_predicted_point.y <= static_cast<float>(frame.rows);
-        if (inside_frame) {
-            const bool gate_active = g_big_prediction_gate.updateLead(
-                true,
-                g_big_variable_speed_prediction_lead,
-                g_buff_rotation_sign,
-                g_big_variable_speed_prediction_lead);
-            if (gate_active) {
-                final_angle_2D = zju_predicted_point;
-                track_ok = true;
-            } else {
-                ROS_WARN_THROTTLE(
-                    0.5,
-                    "[Fu] 大符变速预测尚未连续稳定，保留主路径: "
-                    "big=%.1fdeg",
-                    predicted_roll * 180.0 / CV_PI);
+    // Select one motion model at launch. Rejection/initialization produces no
+    // prediction; it never switches to FFT, another model or an assumed speed.
+    bool pixel_track_ok = false;
+    double measured_radius = 0.0;
+    {
+        BuffStageTimer prediction(g_buff_frame_timing, BuffTimingStage::Predict);
+        const cv::Point2f offset = g_Fan_center - g_R_center;
+        measured_radius = cv::norm(offset);
+        const double measured_angle = std::atan2(offset.y, offset.x);
+        if (MoveMode == "big") {
+            double predicted_angle = 0.0;
+            if (!std::isfinite(measured_radius) || measured_radius <= 1.0) {
+                g_big_buff_predictor.reject();
+            } else if (g_big_buff_predictor.update(g_frame_monotonic_time_seconds,
+                    measured_angle, delta_t_, predicted_angle)) {
+                final_angle_2D = g_R_center + cv::Point2f(
+                    static_cast<float>(measured_radius * std::cos(predicted_angle)),
+                    static_cast<float>(measured_radius * std::sin(predicted_angle)));
+                pixel_track_ok = true;
             }
+            const double speed = g_big_buff_predictor.angular_speed();
+            g_buff_rotation_sign = speed > 0.05 ? 1 : speed < -0.05 ? -1 : 0;
         } else {
-            g_big_prediction_gate.reject();
+            pixel_track_ok = g_small_buff_tracker.update(
+                g_R_center, g_Fan_center, g_frame_monotonic_time_seconds,
+                delta_t_, final_angle_2D);
+            g_buff_rotation_sign = g_small_buff_tracker.lockedDirection();
         }
-    } else if (MoveMode == "big") {
-        g_big_prediction_gate.reject();
+        if (pixel_track_ok) {
+            const double predicted_radius = cv::norm(final_angle_2D - g_R_center);
+            pixel_track_ok = std::isfinite(final_angle_2D.x) &&
+                std::isfinite(final_angle_2D.y) &&
+                final_angle_2D.x > 0.0f && final_angle_2D.x <= frame.cols &&
+                final_angle_2D.y > 0.0f && final_angle_2D.y <= frame.rows &&
+                predicted_radius >= 0.3 * measured_radius &&
+                predicted_radius <= 3.5 * measured_radius;
+            // update() also returns false while acquiring three good frames.
+            // Only reject a produced point that fails geometry validation.
+            if (MoveMode == "big" && !pixel_track_ok) g_big_buff_predictor.reject();
+        }
+        track_ok = pixel_track_ok;
     }
 
+    {
+    BuffStageTimer solve(g_buff_frame_timing, BuffTimingStage::Solve);
     // --- World-frame EKF + two flight-time iterations (disabled by default) ---
      if (g_buff_world_ekf_enabled && g_buff_world_ekf_control_enabled &&
-         g_buff_world_ekf_primary && world_observation_ready) {// EKF is opt-in as the output path.
-        track_ok = true;
+         g_buff_world_ekf_primary) {// Explicitly selected world output never falls back to pixels.
+        track_ok = world_observation_ready;
         euler_angles.x = 0;
         euler_angles.y = 0;
         double hit_time = std::clamp(delta_t_, 0.01, 1.0);//限制时间步长在0.01-1.0之间
-        for (int iteration = 0; iteration < 2; ++iteration) {//迭代两次
+        for (int iteration = 0; iteration < 2 && track_ok; ++iteration) {//迭代两次
             Eigen::Vector3d future_target_map;
             if (!g_buff_world_tracker.predictTarget(hit_time, future_target_map)) {
                 track_ok = false;
                 break;
-                cout<<"2222222222222"<<endl;
             }
             euler_angles = pnpSolver_gravity->solveMapPointAndGravity(
                 future_target_map);
@@ -629,7 +405,6 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
                 new_hit_time >= 1.0) {
                 track_ok = false;
                 break;
-                cout<<"3333333333333"<<endl;
 
 
             }
@@ -649,7 +424,7 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
             pnpSolver_gravity->lastReprojectionError());
         if (euler_angles.x == 0.0 && euler_angles.y == 0.0) {
             track_ok = false;
-            cout<<"4444444444444"<<endl;
+            ROS_DEBUG_THROTTLE(1.0, "[Fu] Predicted PnP rejected");
 
         }//如果PnP求解失败
         // cout<<"55555555555555555"<<endl;
@@ -658,18 +433,18 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
 
     }
 
-    // Log the final decision after the big-buff override and PnP validation;
-    // logging before those branches made a valid output appear as track_ok=false.
+    } // solve timing
+
+    {
+    BuffStageTimer diagnostics(g_buff_frame_timing, BuffTimingStage::Diagnostics);
     ROS_INFO_THROTTLE(
         0.5,
-        "[BUFF_STATE] pixel_track_ok=%s kalman_healthy=%s track_ok=%s "
-        "final_angle_2d=(%.1f,%.1f) radius=%.1f bad_frames=%d",
-        pixel_track_ok ? "true" : "false",
-        kalman_healthy ? "true" : "false",
-        track_ok ? "true" : "false",
-        final_angle_2D.x, final_angle_2D.y,
-        Angleprocess != nullptr ? Angleprocess->radius_buff : -1.0f,
-        kalman_bad_frames);
+        "[BUFF_STATE] mode=%s prediction_ok=%s track_ok=%s "
+        "final_angle_2d=(%.1f,%.1f) radius=%.1f",
+        MoveMode.c_str(), pixel_track_ok ? "true" : "false",
+        track_ok ? "true" : "false", final_angle_2D.x, final_angle_2D.y,
+        measured_radius);
+    }
 
     // Refresh the next-frame lead time from whichever valid trajectory path ran.
     if (track_ok) {
@@ -684,6 +459,8 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
         }
     }
 
+    {
+    BuffStageTimer output(g_buff_frame_timing, BuffTimingStage::Output);
     // --- 发布角度 ---
     if (track_ok) {
         // 原始计算角度（限幅前）
@@ -734,18 +511,16 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
             std::isfinite(raw_angle_x) &&
             std::abs(raw_angle_x - limited_angle_x) > 1e-9;
 
-        if (pitch_limited || !track_ok || !pixel_track_ok ||
-            !kalman_healthy) {
+        if (pitch_limited) {
             ROS_WARN_THROTTLE(
                 0.2,
                 "[BUFF_ANGLE] raw_angle_x=%.6f rad (%.2f deg), "
                 "limited_angle_x=%.6f rad (%.2f deg), "
-                "pixel_track_ok=%s kalman_healthy=%s track_ok=%s "
+                "prediction_ok=%s track_ok=%s "
                 "reproj=%.3f px",
                 raw_angle_x, raw_angle_x * 180.0 / CV_PI,
                 limited_angle_x, limited_angle_x * 180.0 / CV_PI,
                 pixel_track_ok ? "true" : "false",
-                kalman_healthy ? "true" : "false",
                 track_ok ? "true" : "false",
                 pnpSolver_gravity->lastReprojectionError());
         }
@@ -795,7 +570,12 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
         world_ready_pub.publish(world_ready_msg);
     }
 
+    } // output timing
+
     // 重力补偿完成
+
+    if (!g_buff_show_image) return true;
+    BuffStageTimer drawing(g_buff_frame_timing, BuffTimingStage::Draw);
 
     //显示结果(数据可视化)
     //打印预测点

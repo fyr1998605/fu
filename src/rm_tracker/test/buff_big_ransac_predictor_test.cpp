@@ -3,14 +3,17 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <iostream>
 
 namespace {
 
-void require(const bool condition) {
+void require_at_line(const bool condition, int line) {
     if (!condition) {
+        std::cerr << "RANSAC predictor assertion failed at line " << line << '\n';
         std::abort();
     }
 }
+#define require(condition) require_at_line((condition), __LINE__)
 
 }  // namespace
 

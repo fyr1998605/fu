@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <array>
 #include <deque>
 #include <random>
 #include <utility>
@@ -43,7 +44,7 @@ public:
 
 private:
     bool fit_partial_model(
-        const std::vector<std::pair<double, double>>& sample,
+        const std::array<std::pair<double, double>, 3>& sample,
         double omega,
         Eigen::Vector3d& params
     ) const;
