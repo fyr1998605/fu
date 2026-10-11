@@ -105,7 +105,6 @@ add_executable(Fu
   src/buff_recognizer.cpp
   src/buff_zju_ransac.cpp
   src/buff_big_ransac_predictor.cpp
-  src/buff_big_variable_speed_predictor.cpp
   include/CoorConverter.cpp
 )
 add_dependencies(Fu
@@ -123,10 +122,8 @@ target_include_directories(Fu
 target_link_libraries(Fu
   ${catkin_LIBRARIES}
   ${OpenCV_LIBS}
-  ${CERES_LIBRARIES}
   ${Protobuf_LIBRARIES}
   yaml-cpp
-  ${FFTW3_LIB}
   /opt/l_openvino_toolkit_ubuntu20_2024.4.0.16579.c3152d32c9c_x86_64/runtime/lib/intel64/libopenvino.so
 )
 
@@ -151,6 +148,22 @@ target_link_libraries(buff_test
 )
 
 if(CATKIN_ENABLE_TESTING)
+  add_executable(buff_big_predictor_test
+    test/buff_big_predictor_test.cpp
+    src/buff_zju_ransac.cpp
+    src/buff_big_ransac_predictor.cpp
+  )
+  target_include_directories(buff_big_predictor_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  add_test(NAME buff_big_predictor_test COMMAND buff_big_predictor_test)
+
+  add_executable(buff_frame_timing_test test/buff_frame_timing_test.cpp)
+  target_include_directories(buff_frame_timing_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  add_test(NAME buff_frame_timing_test COMMAND buff_frame_timing_test)
+
   add_executable(buff_detection_stabilizer_test
     test/buff_detection_stabilizer_test.cpp
   )

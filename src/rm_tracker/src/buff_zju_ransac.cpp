@@ -101,12 +101,14 @@ void RansacSineFitter::fit() {
     std::iota(indices.begin(), indices.end(), 0);
 
     for (int iteration = 0; iteration < max_iterations_; ++iteration) {
-        std::shuffle(indices.begin(), indices.end(), generator_);
-
-        std::vector<std::pair<double, double>> sample;
-        sample.reserve(3);
+        // Three draws without replacement suffice; shuffling the entire
+        // 300-sample window on every iteration does unnecessary work.
+        std::array<std::pair<double, double>, 3> sample;
         for (int index = 0; index < 3; ++index) {
-            sample.push_back(fit_data_[indices[static_cast<std::size_t>(index)]]);
+            const auto slot = static_cast<std::size_t>(index);
+            std::uniform_int_distribution<std::size_t> pick(slot, indices.size() - 1);
+            std::swap(indices[slot], indices[pick(generator_)]);
+            sample[slot] = fit_data_[indices[slot]];
         }
 
         const double omega = omega_distribution(generator_);
@@ -138,7 +140,7 @@ void RansacSineFitter::fit() {
 }
 
 bool RansacSineFitter::fit_partial_model(
-    const std::vector<std::pair<double, double>>& sample,
+    const std::array<std::pair<double, double>, 3>& sample,
     const double omega,
     Eigen::Vector3d& params
 ) const {
@@ -146,8 +148,8 @@ bool RansacSineFitter::fit_partial_model(
         return false;
     }
 
-    Eigen::MatrixXd design(static_cast<Eigen::Index>(sample.size()), 3);
-    Eigen::VectorXd values(static_cast<Eigen::Index>(sample.size()));
+    Eigen::Matrix3d design;
+    Eigen::Vector3d values;
     for (std::size_t index = 0; index < sample.size(); ++index) {
         const double timestamp = sample[index].first;
         design(static_cast<Eigen::Index>(index), 0) = std::sin(omega * timestamp);
@@ -157,9 +159,9 @@ bool RansacSineFitter::fit_partial_model(
     }
 
     try {
-        const auto svd =
-            design.bdcSvd(Eigen::ComputeThinU | Eigen::ComputeThinV);
-        const Eigen::VectorXd singular_values = svd.singularValues();
+        const Eigen::JacobiSVD<Eigen::Matrix3d> svd(
+            design, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        const Eigen::Vector3d singular_values = svd.singularValues();
         if (singular_values.size() != 3 || !singular_values.allFinite()) {
             return false;
         }

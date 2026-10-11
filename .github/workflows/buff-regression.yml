@@ -1,0 +1,37 @@
+name: Buff regression
+
+on:
+  pull_request:
+    branches: [ros1-auto_aim-fu, main]
+  push:
+    branches: [ros1-auto_aim-fu, main, 'feature/buff-*', 'bugfix/buff-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: buff-regression-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prediction-regressions:
+    name: prediction-regressions
+    runs-on: ubuntu-24.04
+    container: ros:noetic-ros-base-focal
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          sparse-checkout: |
+            src
+            scripts
+          persist-credentials: false
+      - name: Install test dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            cmake g++ pkg-config python3 libeigen3-dev libopencv-dev
+      - name: Run model, small-buff and frame-timing regressions
+        shell: bash
+        run: bash scripts/test_buff.sh

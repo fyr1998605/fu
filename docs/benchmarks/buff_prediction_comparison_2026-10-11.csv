@@ -1,0 +1,13 @@
+input,model,horizon_s,valid_after_4s,mean_error_deg,p95_error_deg,max_error_deg,p99_update_ms,max_update_ms
+clean,variable,0.1500,600/600,0.0930,0.1499,0.1503,0.0004,0.0010
+clean,ransac,0.1500,600/600,0.2799,0.8662,1.4580,0.6959,1.2100
+noise_and_outliers,variable,0.1500,573/600,4.4235,9.2333,12.0794,0.0003,0.0012
+noise_and_outliers,ransac,0.1500,582/600,1.2603,3.3053,5.7115,0.2082,0.3005
+clean,variable,0.3500,600/600,0.9527,1.5519,1.5603,0.0005,0.0233
+clean,ransac,0.3500,600/600,0.7296,2.2256,3.3774,0.6605,0.7787
+noise_and_outliers,variable,0.3500,15/600,28.6152,43.6958,43.6958,0.0003,0.0123
+noise_and_outliers,ransac,0.3500,582/600,2.8744,7.9793,12.8301,0.2911,0.5410
+clean,variable,0.5000,600/600,2.6657,4.3437,4.3651,0.0003,0.0007
+clean,ransac,0.5000,600/600,1.1092,3.3544,4.7085,0.6500,0.7748
+noise_and_outliers,variable,0.5000,0/600,nan,nan,nan,0.0001,0.0003
+noise_and_outliers,ransac,0.5000,579/600,4.0255,10.0524,17.9020,0.2010,0.2392

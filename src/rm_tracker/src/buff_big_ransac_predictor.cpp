@@ -154,20 +154,28 @@ bool BigBuffRansacPredictor::update_polar(
     // Direction-aware unwrap: the shortest arc is ambiguous once the wheel
     // has rotated more than pi over the gap, and a five-blade ID switch adds
     // an apparent 2*pi/5 jump. Pick the alias whose implied velocity
-    // continues the last accepted velocity. Without prior velocity/direction,
+    // follows the fitted sine integral (or the last accepted velocity before
+    // convergence). Without prior velocity/direction,
     // retain the raw shortest arc unless it violates the speed gate.
     // Candidates that violate the speed gate are dropped; if none qualifies,
     // keep the base delta and let
     // update_continuous reject it (feeding the rejection counter below).
-    // Known limit: when the prior velocity is near zero the ambiguity cannot
-    // be resolved; a real direction reversal is handled outside via
-    // g_persistent_rotation_dir, not here.
+    // Long gaps are otherwise ambiguous: the speed at the last image can be
+    // at a trough while the average speed during the gap is much higher.
     double delta = polar_delta;
     if (std::isfinite(delta_time) && delta_time > kEpsilon &&
         delta_time <= config_.max_gap_seconds) {
         const bool have_prior =
             std::isfinite(current_velocity_) &&
             std::abs(current_velocity_) > kEpsilon;
+        double expected_delta = current_velocity_ * delta_time;
+        if (state_.ready && std::abs(state_.omega) > kEpsilon) {
+            expected_delta = state_.offset * delta_time +
+                state_.amplitude *
+                (std::cos(state_.phase) -
+                 std::cos(state_.phase + state_.omega * delta_time)) /
+                state_.omega;
+        }
         double best_delta = polar_delta;
         double best_score = std::numeric_limits<double>::infinity();
         const int max_aliases = std::min(
@@ -186,7 +194,7 @@ bool BigBuffRansacPredictor::update_polar(
             }
             double score = 0.0;
             if (have_prior) {
-                score = std::abs(velocity - current_velocity_);
+                score = std::abs(candidate - expected_delta) / delta_time;
             } else if (rotation_sign_ != 0) {
                 // With a known direction, choose the smallest-speed alias
                 // consistent with that direction. This handles a first-frame
