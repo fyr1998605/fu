@@ -207,6 +207,23 @@ void testOutlierDoesNotReanchor() {
             "a one-frame outlier must not re-anchor the tracked blade");
 }
 
+void testConfirmedSwitchAndCameraMotion() {
+    SmallBuffPhaseTracker tracker;
+    cv::Point2f predicted;
+    for (int i = 0; i < 250; ++i) {
+        const double t = i / kFps;
+        tracker.update({kCenterX, kCenterY}, litBladeCenter(t, 0), t,
+                       kLeadSeconds, predicted);
+    }
+    const double t = 250 / kFps;
+    const cv::Point2f translation(180, -120);
+    const bool ready = tracker.update(cv::Point2f(kCenterX, kCenterY) + translation,
+        litBladeCenter(t, 1) + translation, t, kLeadSeconds, predicted, true);
+    require(ready, "confirmed switch keeps the learned velocity");
+    require(predictionErrorDeg(predicted - translation, t, 1) < 5,
+            "confirmed switch must aim on new blade immediately after camera translation");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -217,6 +234,7 @@ int main(int argc, char** argv) {
     testFollowsTargetSwitch();
     testReversedSwitch();
     testOutlierDoesNotReanchor();
+    testConfirmedSwitchAndCameraMotion();
     if (g_failures != 0) {
         std::cerr << g_failures << " check(s) failed" << std::endl;
         return 1;

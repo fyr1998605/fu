@@ -5,10 +5,12 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/dnn.hpp>
 #include <array>
+#include <algorithm>
+#include <limits>
 #include <vector>
 #include <string>
 
-#include "buff_detection_stabilizer.hpp"
+#include "buff_target_association.hpp"
 
 /**
  * @brief 能量机关(大/小符)识别器 — 单一 YOLO11 关键点模型, 替换旧的 YOLOV8_R + 传统CV
@@ -110,8 +112,8 @@ public:
     BuffRecognizer(const std::string& model_path,
                    const std::string& enemy_color = "blue");
 
-    // "locked" keeps the first successfully associated blade while it is
-    // temporarily missing; "confidence" retains the legacy re-acquisition.
+    // "locked" preserves a visible physical blade; "confidence" explicitly
+    // allows a higher-confidence blade after confirmation.
     void setTargetPriority(const std::string& priority,
                            double lock_timeout_seconds = 0.25);
 
@@ -120,7 +122,8 @@ public:
     bool init(const cv::Mat& frame,
               cv::Point2f& out_R_center,
               cv::Point2f& out_Fan_center,
-              double&      out_side);
+              double&      out_side,
+              double timestamp_seconds = -1.0);
 
     // ========== 逐帧识别 ==========
     /**
@@ -133,13 +136,25 @@ public:
      *   4) kpt[4] → out_Fan_center (扇叶中心)
      *   5) |kpt[0]-kpt[2]| → out_side (扇叶边长)
      *   6) kpt[0~3] → out_corners (4个PnP角点)
-     *   7) 时序校验: 跳变>阈值则连3帧确认, 防止相机移动误检
+     *   7) 五扇叶相位关联与ID锁定, 换靶连3帧确认
      */
     bool identify(const cv::Mat& frame,
                   cv::Point2f& out_R_center,
                   cv::Point2f& out_Fan_center,
                   double&      out_side,
-                  std::vector<cv::Point2f>& out_corners);
+                  std::vector<cv::Point2f>& out_corners,
+                  double timestamp_seconds = -1.0);
+
+    void beginFrame() { fresh_observation_ = false; association_result_ = {}; detections_.clear(); }
+    void resetTracking() { association_.reset(); stabilizer_.reset(); has_prev_ = false; beginFrame(); }
+    void setExpectedAngularSpeed(double speed) { expected_speed_ = speed; }
+    bool targetChanged() const { return association_result_.changed; }
+    bool freshObservation() const { return fresh_observation_; }
+    bool hasAssociatedObservation() const {
+        return std::any_of(association_result_.candidate_ids.begin(),
+            association_result_.candidate_ids.end(), [](int id) { return id >= 0; });
+    }
+    int lockedBladeId() const { return association_.lockedId(); }
 
     // ========== 可视化 ==========
     /// 绘制: R中心(红圆), 扇叶中心(绿圆), PnP角点(黄圆), 检测框(白框), side值
@@ -150,19 +165,6 @@ public:
     cv::Point2f lastFanCenter()   const { return last_Fan_center_; }
     double      lastSide()        const { return last_side_; }
     const std::vector<cv::Point2f>& lastCorners() const { return last_corners_; }
-
-    // ========== 自运动补偿接口 ==========
-    /// Set camera intrinsics for ego-motion compensation (called once during init).
-    void setEgoMotionIntrinsics(float fx, float fy) { fx_ = fx; fy_ = fy; }
-    /// Feed current gimbal feedback before each identify() call.
-    /// The method stores the values and returns the frame-to-frame delta
-    /// so the caller can use it for diagnostic logging if desired.
-    void feedGimbalFeedback(float pitch_rad, float yaw_rad) {
-        prev_gimbal_pitch_ = current_gimbal_pitch_;
-        prev_gimbal_yaw_   = current_gimbal_yaw_;
-        current_gimbal_pitch_ = pitch_rad;
-        current_gimbal_yaw_   = yaw_rad;
-    }
 
 private:
     // ========== R中心精化 ==========
@@ -179,15 +181,12 @@ private:
 
     int selectTemporalDetection(
         const std::vector<BuffDetection>& detections,
-        double timestamp_seconds) const;
+        double timestamp_seconds);
 
     BuffStabilizedGeometry stabilizeDetection(
         const cv::Point2f& raw_r_center,
         const cv::Point2f& raw_fan_center,
         const std::vector<cv::Point2f>& raw_corners);
-
-    void resetTemporalState();
-    void noteTrackingLoss(double timestamp_seconds);
 
     /// BGR→灰度→二值化→膨胀, 用于提取装甲板白色区域
     void handleImage(const cv::Mat& bgr_img, cv::Mat& dilated_img);
@@ -195,14 +194,17 @@ private:
     // ========== 成员变量 ==========
     YoloBuffDetector detector_;
     BuffDetectionStabilizer stabilizer_;
-    BuffTargetLock target_lock_;
+    BuffBladeAssociation association_;
+    BuffBladeAssociation::Result association_result_;
+    std::vector<BuffDetection> detections_;
+    bool fresh_observation_ = false;
+    double expected_speed_ = std::numeric_limits<double>::quiet_NaN();
     bool target_priority_locked_ = true;
 
     // 识别结果缓存 (最近一帧)
     cv::Point2f last_R_center_   = {0, 0};
     cv::Point2f last_Fan_center_ = {0, 0};
     double      last_side_       = 0;
-    double      last_track_radius_ = 0;
     std::vector<cv::Point2f> last_corners_;
     cv::Rect_<float> last_R_box_;
     bool        has_prev_       = false;
@@ -213,22 +215,7 @@ private:
     double r_center_mask_ratio_      = 0.8;  // mask半径比例
     double r_center_contour_div_     = 3.0;  // 距离惩罚因子
     double r_center_refine_max_shift_ = 5.0; // 精化最大位移(px)
-    float  box_alpha_                = 0.3f; // 检测框EMA平滑系数
 
-    // 时序状态
-    int    last_quadrant_       = -1;
-    int    quadrant_stable_cnt_ = 0;
-    int    active_quadrant_     = -1;
-    int    consecutive_fail_    = 0;    // 连续失败帧数
-    int    jump_reject_cnt_     = 0;    // 连续跳变帧数(相机移动自适应)
-
-    // 自运动补偿: 相机内参 + 云台反馈
-    float  fx_ = 0.0f;
-    float  fy_ = 0.0f;
-    float  prev_gimbal_pitch_ = 0.0f;
-    float  prev_gimbal_yaw_   = 0.0f;
-    float  current_gimbal_pitch_ = 0.0f;
-    float  current_gimbal_yaw_   = 0.0f;
 };
 
 #endif // BUFF_RECOGNIZER_HPP

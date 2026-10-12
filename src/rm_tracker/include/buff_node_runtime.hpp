@@ -35,7 +35,7 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
     }
     const bool previous_functional = functional;
     if(serail->ShootFlag == 'f'){
-        ROS_INFO_THROTTLE(2.0, "[Fu] 串口指令: 大符模式, Fu节点激活");
+        ROS_INFO_THROTTLE(2.0, "[Fu] 串口指令: 能量机关激活, 配置模式=%s", MoveMode.c_str());
         functional = true;
     }
     else if(serail->ShootFlag == 'a'){
@@ -49,6 +49,7 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
         g_big_buff_predictor.reset();
         g_small_buff_tracker.reset();
         g_buff_rotation_sign = 0;
+        if (g_recognizer) g_recognizer->resetTracking();
     }
     if(serail->Camp=='b')
     {
@@ -153,6 +154,8 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
             return false;
         }
         g_processed_frame_sequence = g_frame_sequence;
+        g_buff_prediction_ready = false;
+        g_recognizer->beginFrame();
         {
             BuffStageTimer copy(g_buff_frame_timing, BuffTimingStage::Copy);
             frame = frame_.clone(); // Drawing owns its buffer; copy each image once.
@@ -163,19 +166,16 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
         if(frame.empty()){
             return false;
         }
-        // Feed gimbal feedback only to the big-buff path. The recognizer's
-        // compensated pixel gate is shared with ordinary candidate selection,
-        // so keeping this disabled in small mode preserves its old behavior.
-        if (MoveMode == "big") {
-            g_recognizer->feedGimbalFeedback(
-                static_cast<float>(RmSerialData.Pitch),
-                static_cast<float>(RmSerialData.Yaw));
-        }
+        g_recognizer->setExpectedAngularSpeed(MoveMode == "big"
+            ? (g_buff_rotation_sign != 0 ? g_big_buff_predictor.angular_speed()
+                : std::numeric_limits<double>::quiet_NaN())
+            : g_small_buff_tracker.angularSpeed());
     //帧率计算
 
     std::chrono::steady_clock::time_point fps_start = std::chrono::steady_clock::now();//记录当前时间点
 
 
+    bool initialized_this_frame = false;
     if (!init)
     {
         BuffStageTimer initialization(g_buff_frame_timing, BuffTimingStage::Initialize);
@@ -186,7 +186,8 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
         cv::Point2f init_R, init_Fan;
         double init_side;
         // cout << "7777777777777777777" << endl;
-        if (!g_recognizer->init(frame, init_R, init_Fan, init_side))//初始化识别器，返回是否成功
+        if (!g_recognizer->init(frame, init_R, init_Fan, init_side,
+                                g_frame_monotonic_time_seconds))
 
         {
             ROS_WARN("[Fu] 首帧识别失败!");
@@ -227,6 +228,7 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
         euler_angles = {0, 0};//储存发送的空间角
 
         init = true;//完成初始化
+        initialized_this_frame = true;
         // cout << "71111111111111111177" << endl;
     }
 
@@ -243,11 +245,16 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
     // 输出: g_R_center/g_Fan_center→所选运动模型, g_side→PnPSolver_gravity
     {
     BuffStageTimer identify(g_buff_frame_timing, BuffTimingStage::Identify);
-    if (!g_recognizer->identify(frame, g_R_center, g_Fan_center, g_side, g_corners))//识别目标，返回是否成功
+    if (!initialized_this_frame &&
+        !g_recognizer->identify(frame, g_R_center, g_Fan_center, g_side, g_corners,
+                                g_frame_monotonic_time_seconds))
 
     {
         ROS_DEBUG("[Fu] 识别失败");
-        g_big_buff_predictor.reject();
+        // A pending blade selection has a valid wheel association. Keep the
+        // learned model's readiness while withholding output; otherwise every
+        // switch incurs another three-frame warm-up after selection confirmation.
+        if (!g_recognizer->hasAssociatedObservation()) g_big_buff_predictor.reject();
         return false;   // 检测失败 → 无目标, 不画图
     }
 // cout << "22222222222222222222777777" << endl;
@@ -363,7 +370,7 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
         } else {
             pixel_track_ok = g_small_buff_tracker.update(
                 g_R_center, g_Fan_center, g_frame_monotonic_time_seconds,
-                delta_t_, final_angle_2D);
+                delta_t_, final_angle_2D, g_recognizer->targetChanged());
             g_buff_rotation_sign = g_small_buff_tracker.lockedDirection();
         }
         if (pixel_track_ok) {
@@ -574,13 +581,13 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
 
     // 重力补偿完成
 
+    g_buff_prediction_ready = track_ok;
     if (!g_buff_show_image) return true;
     BuffStageTimer drawing(g_buff_frame_timing, BuffTimingStage::Draw);
 
     //显示结果(数据可视化)
     //打印预测点
     // ★ 绘制识别器检测结果: R中心(红圆) 扇叶中心(绿圆) PnP角点(黄圆) 检测框(白框)
-    g_recognizer->visual(frame);
 
     // ── 绘制世界卡尔曼重投影点（参照装甲板EKF可视化）──
     if (has_world_reproj) {

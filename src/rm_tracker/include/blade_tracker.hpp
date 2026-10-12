@@ -104,7 +104,8 @@ public:
                 const cv::Point2f& blade_center,
                 double timestamp_seconds,
                 double predict_seconds,
-                cv::Point2f& predicted_center) {
+                cv::Point2f& predicted_center,
+                bool confirmed_blade_switch = false) {
         const cv::Point2f offset = blade_center - r_center;
         const double measured_radius = cv::norm(offset);
         if (!isFinitePoint(r_center) || !isFinitePoint(blade_center) ||
@@ -232,8 +233,10 @@ public:
             kalman_.statePost.at<double>(1, 0) = omega;
         }
 
-        radius_ = 0.9 * radius_ + 0.1 * measured_radius;
-        center_ = center_ * 0.8f + r_center * 0.2f;
+        // The phase filter handles rotation. Follow this frame's camera-space
+        // geometry so gimbal motion is not delayed by a second center EMA.
+        radius_ = measured_radius;
+        center_ = r_center;
         last_timestamp_ = timestamp_seconds;
         last_observed_phase_ = observed_phase;
         rejected_count_ = 0;
@@ -291,7 +294,12 @@ public:
                 raw_angle - filtered_phase, 2.0 * CV_PI);
             const int implied_steps = static_cast<int>(
                 std::lround(measurement_delta / kBladePeriod));
-            if (implied_steps == blade_anchor_steps_) {
+            if (confirmed_blade_switch) {
+                // The association layer already confirmed this physical blade
+                // over multiple frames; do not aim at the old blade for another frame.
+                blade_anchor_steps_ = implied_steps;
+                pending_anchor_count_ = 0;
+            } else if (implied_steps == blade_anchor_steps_) {
                 pending_anchor_count_ = 0;
             } else if (implied_steps == pending_anchor_steps_) {
                 // Require the new blade on two consecutive frames: a real
@@ -339,6 +347,11 @@ public:
 		}
     }
 	int lockedDirection() const { return locked_direction_; }
+    double angularSpeed() const {
+        return initialized_ && locked_direction_ != 0
+            ? kalman_.statePost.at<double>(1, 0)
+            : std::numeric_limits<double>::quiet_NaN();
+    }
 	// Multiple of 2*pi/5 that anchors the blade-invariant Kalman phase to the
 	// blade the detector currently reports (the lit target). 0 right after
 	// (re)initialization, +/- the blade period after a confirmed 靶子 switch.

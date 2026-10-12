@@ -83,6 +83,7 @@ std::deque<TimedImuPose> g_imu_pose_history;
 TimedImuPose g_frame_imu_pose;
 ros::Time g_frame_image_stamp;
 double g_frame_monotonic_time_seconds = 0.0;
+bool g_buff_prediction_ready = false;
 std::uint64_t g_frame_sequence = 0;
 std::uint64_t g_processed_frame_sequence = 0;
 bool g_has_frame_imu_pose = false;
@@ -397,11 +398,8 @@ int main(int argc, char *argv[])
 
     g_recognizer = new BuffRecognizer(buff_model_path, enemy_color);
     g_recognizer->setTargetPriority(
-        MoveMode == "big" ? buff_target_priority : "confidence",
+        buff_target_priority,
         buff_target_lock_timeout_seconds);
-    g_recognizer->setEgoMotionIntrinsics(
-        static_cast<float>(g_buff_camera_matrix[0]),
-        static_cast<float>(g_buff_camera_matrix[4]));
 
     ros::Subscriber SubCamera = nh.subscribe("/hikrobot_camera/rgb", 1, &doimage);
     ros::Subscriber SubRmSerial = nh.subscribe("/RmSerialData", 1000, &doserial);
@@ -457,6 +455,21 @@ int main(int argc, char *argv[])
         }
 
         if (g_buff_show_image && !frame.empty()) {
+            if (fresh_frame) {
+                BuffStageTimer drawing(g_buff_frame_timing, BuffTimingStage::Draw);
+                g_recognizer->visual(frame);
+                const std::string mode_label = MoveMode == "big"
+                    ? "BUFF: BIG / RANSAC" : "BUFF: SMALL / KALMAN";
+                cv::putText(frame, mode_label, cv::Point(15, frame.rows - 55),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(0, 255, 255), 2);
+                cv::putText(frame, cv::format("%s  ID:%d  %s  frame:%llu",
+                    functional ? "ACTIVE" : "IDLE", g_recognizer->lockedBladeId(),
+                    g_buff_prediction_ready ? "AIM READY" :
+                        g_recognizer->freshObservation() ? "MODEL WAIT" : "NO OBS",
+                    static_cast<unsigned long long>(g_frame_sequence)),
+                    cv::Point(15, frame.rows - 25), cv::FONT_HERSHEY_SIMPLEX,
+                    0.6, cv::Scalar(0, 255, 255), 2);
+            }
             BuffStageTimer display(g_buff_frame_timing, BuffTimingStage::Display);
             if (fresh_frame) cv::imshow("Image with Point", frame);
             if (cv::waitKey(1) == 'q') return 0;

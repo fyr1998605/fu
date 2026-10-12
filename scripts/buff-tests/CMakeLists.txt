@@ -23,11 +23,13 @@ function(buff_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
-foreach(name buff_big_predictor_test buff_big_ransac_predictor_test buff_zju_ransac_test)
+foreach(name buff_big_predictor_test buff_big_ransac_predictor_test buff_zju_ransac_test
+             buff_blade_prediction_pipeline_test)
   buff_test(${name})
   target_link_libraries(${name} PRIVATE buff_sine)
 endforeach()
 foreach(name buff_big_prediction_gate_test buff_frame_timing_test
+             buff_target_association_test
              buff_detection_stabilizer_test buff_prediction_geometry_test)
   buff_test(${name})
 endforeach()

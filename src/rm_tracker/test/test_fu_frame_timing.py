@@ -2,6 +2,7 @@
 """Regression checks for bounded latest-frame timing in the Fu node."""
 
 from pathlib import Path
+import hashlib
 import unittest
 
 
@@ -15,6 +16,19 @@ PNP_SOURCE = REPO_ROOT / "src" / "rm_tracker" / "include" / "buff_pnp_solver.hpp
 
 
 class FuFrameTimingTest(unittest.TestCase):
+    def test_existing_neural_detector_and_r_refinement_are_preserved(self):
+        source = (REPO_ROOT / "src/rm_tracker/src/buff_recognizer.cpp").read_text(encoding="utf-8")
+        detector = source[source.index("YoloBuffDetector::YoloBuffDetector("):
+                          source.index("BuffRecognizer::BuffRecognizer(")]
+        refinement = source[source.index("cv::Point2f BuffRecognizer::refineRCenter("):
+                            source.index("int BuffRecognizer::selectTemporalDetection(")]
+        # Compatibility contract from maintenance branch 2f4c164: model input,
+        # classes, keypoint mapping, parser, NMS and CV refinement stay identical.
+        self.assertEqual(hashlib.sha256(detector.encode()).hexdigest(),
+                         "427716e8d6ee53d7e89d405f272172d23136065421b86766199270b9165cf7f1")
+        self.assertEqual(hashlib.sha256(refinement.encode()).hexdigest(),
+                         "c27cb517d04d4263eb419110c715a79827090b3cdd3d9dba0185c0adf1b72835")
+
     def test_big_acquisition_is_not_reset_when_waiting_for_three_good_frames(self):
         runtime = RUNTIME_SOURCE.read_text(encoding="utf-8")
         validation_start = runtime.index("if (pixel_track_ok) {")
@@ -79,13 +93,13 @@ class FuFrameTimingTest(unittest.TestCase):
         recognizer = (REPO_ROOT / "src" / "rm_tracker" / "src" /
                       "buff_recognizer.cpp").read_text(encoding="utf-8")
         header = (REPO_ROOT / "src" / "rm_tracker" / "include" /
-                  "buff_detection_stabilizer.hpp").read_text(encoding="utf-8")
+                  "buff_target_association.hpp").read_text(encoding="utf-8")
 
         self.assertIn("buff_target_priority: locked", config)
         self.assertIn("buff_target_lock_timeout_seconds: 0.25", config)
         self.assertIn("setTargetPriority", recognizer)
-        self.assertIn("target_lock_.select", recognizer)
-        self.assertIn("class BuffTargetLock", header)
+        self.assertIn("association_.update", recognizer)
+        self.assertIn("class BuffBladeAssociation", header)
 
     def test_world_ekf_observation_uses_shared_monotonic_frame_time(self):
         pnp = PNP_SOURCE.read_text(encoding="utf-8")

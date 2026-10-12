@@ -257,7 +257,6 @@ std::vector<BuffDetection> YoloBuffDetector::getMultiBoxes(cv::Mat& image) {
 BuffRecognizer::BuffRecognizer(const std::string& model_path,
                                const std::string& enemy_color)
     : detector_(model_path, 0.2f, 0.2f, (enemy_color == "blue" ? 0 : 1))
-    //            模型路径    置信度 NMS    enemy_class: blue→0(red行), red→1(blue行)
 {
     ROS_INFO("[BuffRecognizer] 初始化完成, model=%s, enemy=%s",
              model_path.c_str(), enemy_color.c_str());
@@ -266,7 +265,7 @@ BuffRecognizer::BuffRecognizer(const std::string& model_path,
 void BuffRecognizer::setTargetPriority(
     const std::string& priority, const double lock_timeout_seconds) {
     target_priority_locked_ = priority != "confidence";
-    target_lock_.setTimeoutSeconds(lock_timeout_seconds);
+    association_.setTimeoutSeconds(lock_timeout_seconds);
     ROS_INFO("[BuffRecognizer] 目标优先级: %s, 锁定超时: %.3fs",
              target_priority_locked_ ? "locked" : "confidence",
              std::max(0.01, lock_timeout_seconds));
@@ -349,67 +348,15 @@ cv::Point2f BuffRecognizer::refineRCenter(const cv::Mat& bgr_img,
 
 int BuffRecognizer::selectTemporalDetection(
     const std::vector<BuffDetection>& detections,
-    const double timestamp_seconds) const {
+    const double timestamp_seconds) {
     std::vector<BuffTemporalCandidate> candidates;
-    candidates.reserve(detections.size());
-    for (const BuffDetection& detection : detections) {
-        candidates.push_back({
-            {detection.kpt[5].x, detection.kpt[5].y},
-            {detection.kpt[4].x, detection.kpt[4].y},
-            detection.prob});
+    for (const auto& detection : detections) {
+        candidates.push_back({{detection.kpt[5].x, detection.kpt[5].y},
+                              {detection.kpt[4].x, detection.kpt[4].y}, detection.prob});
     }
-
-    float association_gate_px = 0.0f;
-    if (has_prev_) {
-        association_gate_px = BuffDetectionStabilizer::associationGateForRadius(
-            static_cast<float>(last_track_radius_));
-    }
-
-    // ── Ego-motion compensation (diagnostic version, Section 4.2/Stage C) ──
-    // Without compensation, gimbal motion alone can push the correct target
-    // beyond the association gate (~54-68 px). A 2° yaw change ≈ 60 px at
-    // fx≈1725, easily exceeding the gate.
-    //
-    // Diagnostic approximation: Δu ≈ fx × Δyaw,  Δv ≈ fy × (-Δpitch)
-    // Formal implementation should use IMU poses, extrinsics, and
-    // cv::undistortPoints / cv::projectPoints.
-    //
-    // Camera intrinsics and gimbal feedback are injected via setEgoMotionIntrinsics()
-    // and feedGimbalFeedback() so this file does not depend on Fu.cpp globals.
-    BuffPoint compensated_prev_fan = {last_Fan_center_.x, last_Fan_center_.y};
-    if (has_prev_ && fx_ > 0.0f && fy_ > 0.0f &&
-        std::isfinite(prev_gimbal_pitch_) && std::isfinite(prev_gimbal_yaw_) &&
-        std::isfinite(current_gimbal_pitch_) && std::isfinite(current_gimbal_yaw_)) {
-        const float dpitch = current_gimbal_pitch_ - prev_gimbal_pitch_;
-        const float dyaw   = current_gimbal_yaw_   - prev_gimbal_yaw_;
-        // Only compensate when deltas are physically plausible.
-        // A single-frame gimbal change >15° (~450 px at fx≈1725) is a sensor glitch,
-        // not real motion — skip compensation rather than corrupting the gate.
-        if (std::abs(dpitch) < 0.262f && std::abs(dyaw) < 0.262f) {  // 15° in radians
-            // Small-angle approximation for gimbal rotation:
-            //   yaw positive (camera turns right) → image content shifts left  → Δu ≈ -fx·Δyaw
-            //   pitch positive (camera tilts up)  → image content shifts down → Δv ≈ +fy·Δpitch
-            compensated_prev_fan.x -= fx_ * dyaw;
-            compensated_prev_fan.y += fy_ * dpitch;
-        }
-    }
-
-    if (target_priority_locked_ && target_lock_.locked() && has_prev_) {
-        association_gate_px = std::min(
-            association_gate_px,
-            BuffDetectionStabilizer::lockedAssociationGateForRadius(
-                static_cast<float>(last_track_radius_)));
-    }
-
-    const int index = target_priority_locked_
-        ? target_lock_.select(
-              candidates, association_gate_px,
-              timestamp_seconds,
-              {compensated_prev_fan.x - last_Fan_center_.x,
-               compensated_prev_fan.y - last_Fan_center_.y})
-        : BuffDetectionStabilizer::selectCandidate(
-              candidates, compensated_prev_fan, has_prev_, association_gate_px);
-    return index;
+    association_result_ = association_.update(
+        candidates, timestamp_seconds, expected_speed_, target_priority_locked_);
+    return association_result_.index;
 }
 
 BuffStabilizedGeometry BuffRecognizer::stabilizeDetection(
@@ -422,284 +369,90 @@ BuffStabilizedGeometry BuffRecognizer::stabilizeDetection(
     }
     return stabilizer_.update(
         {{raw_r_center.x, raw_r_center.y}, {raw_fan_center.x, raw_fan_center.y}, 0.0f},
-        corners);
+        corners, association_result_.changed || !has_prev_);
 }
 
-void BuffRecognizer::resetTemporalState() {
-    const bool require_reacquisition =
-        has_prev_ || stabilizer_.isAwaitingReacquisition();
-    stabilizer_.reset();
-    if (require_reacquisition) stabilizer_.beginReacquisition();
-    has_prev_ = false;
-    jump_reject_cnt_ = 0;
-    last_track_radius_ = 0.0;
-    last_corners_.clear();
-    target_lock_.reset();
+// Initialization uses the same observation/association path as later frames.
+bool BuffRecognizer::init(const cv::Mat& frame, cv::Point2f& out_R_center,
+                          cv::Point2f& out_Fan_center, double& out_side,
+                          double timestamp_seconds) {
+    std::vector<cv::Point2f> corners;
+    return identify(frame, out_R_center, out_Fan_center, out_side, corners,
+                    timestamp_seconds);
 }
 
-void BuffRecognizer::noteTrackingLoss(const double timestamp_seconds) {
-    if (target_priority_locked_ && target_lock_.locked() &&
-        target_lock_.noteMiss(timestamp_seconds)) {
-        // Keep the last accepted geometry and lock through a short detector
-        // dropout. The next multi-box result is still associated to this lock.
-        stabilizer_.clearPendingJump();
-        return;
+bool BuffRecognizer::identify(const cv::Mat& frame, cv::Point2f& out_R_center,
+                              cv::Point2f& out_Fan_center, double& out_side,
+                              std::vector<cv::Point2f>& out_corners,
+                              double timestamp_seconds) {
+    beginFrame();
+    if (frame.empty()) return false;
+    if (timestamp_seconds < 0.0) {
+        // Only standalone detector users lack the shared image-arrival clock.
+        timestamp_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
     }
-    resetTemporalState();
-}
-
-// ====== 首帧初始化 ======
-// YOLO推理 → kpt[5]→refineRCenter→R中心, kpt[4]→扇叶中心, |kpt[0]-kpt[2]|→边长
-bool BuffRecognizer::init(const cv::Mat& frame,
-                          cv::Point2f& out_R_center,
-                          cv::Point2f& out_Fan_center,
-                          double&      out_side) {
-    if (frame.empty()) {
-        ROS_WARN("[BuffRecognizer] init: 输入图像为空");
-        return false;
-    }
-
-    cv::Mat frame_copy = frame.clone();
-    auto results = detector_.getBestBox(frame_copy);
-    int64 t_yolo_end = cv::getTickCount();
-    if (results.empty()) {
-        ROS_WARN("[BuffRecognizer] init: 首帧未检测到目标");
-        return false;
-    }
-
-    auto& kpt = results[0].kpt;
-
-    // ★ kpt[5] → R中心精化
-    const cv::Point2f raw_r_center = refineRCenter(frame, kpt);
-    int64 t_refine_end = cv::getTickCount();
-    // ★ kpt[4] → 扇叶中心
-    const cv::Point2f raw_fan_center = kpt[4];
-    // ★ 上下边中点距离 → 扇叶边长
-    out_side = cv::norm(kpt[0] - kpt[2]);
-    stabilizer_.reset();
-    const BuffStabilizedGeometry stabilized = stabilizeDetection(
-        raw_r_center, raw_fan_center, {kpt[0], kpt[1], kpt[2], kpt[3]});
-    out_R_center = {stabilized.r_center.x, stabilized.r_center.y};
-    out_Fan_center = {stabilized.fan_center.x, stabilized.fan_center.y};
-
-    // 保存状态
-    last_R_center_   = out_R_center;
-    last_Fan_center_ = out_Fan_center;
-    last_side_       = out_side;
-    last_track_radius_ = cv::norm(raw_fan_center - raw_r_center);
-    last_corners_    = {
-        {stabilized.corners[0].x, stabilized.corners[0].y},
-        {stabilized.corners[1].x, stabilized.corners[1].y},
-        {stabilized.corners[2].x, stabilized.corners[2].y},
-        {stabilized.corners[3].x, stabilized.corners[3].y}};
-    last_R_box_      = results[0].rect;
-    has_prev_        = true;
-    const double now_seconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    target_lock_.lock({out_Fan_center.x, out_Fan_center.y}, now_seconds);
-
-    ROS_INFO("[BuffRecognizer] 首帧初始化成功: R(%d,%d) Fan(%d,%d) side=%.1f",
-             (int)out_R_center.x, (int)out_R_center.y,
-             (int)out_Fan_center.x, (int)out_Fan_center.y, out_side);
-    return true;
-}
-
-// ====== ★ 逐帧识别 (核心!) ======
-// 每帧调用, 完整7步:
-//   ① YOLO推理 ② remap 9→6 ③ R中心精化 ④ 扇叶中心 ⑤ 边长 ⑥ PnP角点 ⑦ 时序校验
-bool BuffRecognizer::identify(const cv::Mat& frame,
-                              cv::Point2f& out_R_center,
-                              cv::Point2f& out_Fan_center,
-                              double&      out_side,
-                              std::vector<cv::Point2f>& out_corners) {
-    if (frame.empty()) {
-        ROS_WARN("[BuffRecognizer] identify: 输入图像为空");
-        return false;
-    }
-    const double now_seconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-
-    // ═══ Step 1-2: YOLO 推理 → 9原始关键点 → remap → 6标准关键点 ═══
-    int64 t_yolo_start = cv::getTickCount();
-    cv::Mat frame_copy = frame.clone();
-    auto results = detector_.getMultiBoxes(frame_copy);
-    int64 t_yolo_end = cv::getTickCount();
-    if (results.empty()) {
-        consecutive_fail_++;
-        noteTrackingLoss(now_seconds);
-        ROS_DEBUG("[BuffRecognizer] 未检测到目标 (连续失败:%d)", consecutive_fail_);
-        return false;
-    }
-    consecutive_fail_ = 0;
-
-    const int selected_idx = selectTemporalDetection(results, now_seconds);
-    if (selected_idx < 0) {
-        // Association failed: no candidate within the spatial gate.
-        // Enter reacquisition instead of silently picking a distant
-        // high-confidence candidate (see Section 4.3 of the bug-fix document).
-        consecutive_fail_++;
-        noteTrackingLoss(now_seconds);
-        ROS_WARN_THROTTLE(0.5,
-            "[BuffRecognizer] 时序关联失败: 无候选在关联门限内 (candidates=%zu)", results.size());
-        return false;
-    }
-    const BuffDetection& selected = results[selected_idx];
+    // The model's original detector draws into its input; preserve its complete
+    // preprocessing/parser/NMS contract and keep annotations off the source.
+    cv::Mat detector_frame = frame.clone();
+    detections_ = detector_.getMultiBoxes(detector_frame);
+    detections_.erase(std::remove_if(detections_.begin(), detections_.end(),
+        [](const BuffDetection& d) {
+            return d.kpt.size() != 6 || !std::isfinite(d.prob) ||
+                !std::all_of(d.kpt.begin(), d.kpt.end(), [](const cv::Point2f& p) {
+                    return std::isfinite(p.x) && std::isfinite(p.y);
+                }) || cv::norm(d.kpt[0] - d.kpt[2]) <= 1.0;
+        }), detections_.end());
+    const int index = selectTemporalDetection(detections_, timestamp_seconds);
+    if (index < 0) return false;  // No cached geometry masquerades as a new measurement.
+    const auto& selected = detections_[index];
     const auto& kpt = selected.kpt;
-    // kpt[0]=顶边中点  kpt[1]=左边中点  kpt[2]=底边中点  kpt[3]=右边中点
-    // kpt[4]=靶心(扇叶中心)  kpt[5]=R中心(模型直出)
-
-    // ═══ Step 3: kpt[5] → refineRCenter() 精化 → out_R_center ═══
-    int64 t_refine_start = cv::getTickCount();
-    const cv::Point2f raw_r_center = refineRCenter(frame, kpt);
-    int64 t_refine_end = cv::getTickCount();
-
-    // ═══ Step 4: kpt[4] → out_Fan_center (扇叶中心) ═══
-    const cv::Point2f raw_fan_center = kpt[4];
-
-    // ═══ Step 5: |kpt[0]-kpt[2]| → out_side (上下边距离) ═══
+    const cv::Point2f raw_r = refineRCenter(frame, kpt);
+    const cv::Point2f raw_fan = kpt[4];
+    const auto geometry = stabilizeDetection(raw_r, raw_fan,
+                                             {kpt[0], kpt[1], kpt[2], kpt[3]});
+    out_R_center = {geometry.r_center.x, geometry.r_center.y};
+    out_Fan_center = {geometry.fan_center.x, geometry.fan_center.y};
     out_side = cv::norm(kpt[0] - kpt[2]);
-
-    // ═══ Step 6: kpt[0~3] → out_corners (4个PnP角点) ═══
-    const std::vector<cv::Point2f> raw_corners{kpt[0], kpt[1], kpt[2], kpt[3]};
-
-    // ═══ Step 7: 时序一致性校验 ═══
-    // 相机移动时模型可能误检 → 扇叶位移>半径×0.55 或 R位移>半径×0.35 → 跳变
-    const double radius = cv::norm(raw_fan_center - raw_r_center);
-    const BuffTemporalCandidate measurement{
-        {raw_r_center.x, raw_r_center.y}, {raw_fan_center.x, raw_fan_center.y}, selected.prob};
-
-    if (!stabilizer_.confirmReacquisition(
-            measurement, BuffDetectionStabilizer::associationGateForRadius(
-                             static_cast<float>(radius)))) {
-        ROS_DEBUG("[BuffRecognizer] 重捕获待确认");
-        return false;
-    }
-
-    // Only accept a jump after the following frame confirms the same candidate.
-    if (has_prev_) {
-        float dist_fan = cv::norm(raw_fan_center - last_Fan_center_);
-        float dist_r   = cv::norm(raw_r_center   - last_R_center_);
-        if (dist_fan > radius * 0.55f || dist_r > radius * 0.35f) {
-            if (target_priority_locked_ &&
-                !target_lock_.canAcceptGenericJump(now_seconds)) {
-                stabilizer_.clearPendingJump();
-                out_R_center = last_R_center_;
-                out_Fan_center = last_Fan_center_;
-                out_side = last_side_;
-                out_corners = last_corners_;
-                noteTrackingLoss(now_seconds);
-                ROS_WARN_THROTTLE(
-                    0.5,
-                    "[BuffRecognizer] 锁定目标拒绝跨扇叶跳变: fan=%.1f r=%.1f",
-                    dist_fan, dist_r);
-                return false;
-            }
-            const float association_gate_px =
-                BuffDetectionStabilizer::associationGateForRadius(
-                    static_cast<float>(std::max(radius, last_track_radius_)));
-            const bool confirmed_jump = stabilizer_.confirmPersistentJump(
-                measurement, association_gate_px);
-            if (!confirmed_jump) {
-                jump_reject_cnt_ = 1;
-                ROS_DEBUG("[BuffRecognizer] 跳变待确认: fan=%.1f r=%.1f", dist_fan, dist_r);
-                out_R_center = last_R_center_;
-                out_Fan_center = last_Fan_center_;
-                out_side = last_side_;
-                out_corners = last_corners_;
-                return true;
-            }
-            jump_reject_cnt_ = 0;
-            // Geometry validation before accepting the jump (Section 4.4):
-            // even if three consecutive frames agree spatially, reject the
-            // jump if the new target's radius or side differs dramatically
-            // from the previously tracked target.
-            const double new_radius = cv::norm(raw_fan_center - raw_r_center);
-            const double radius_change_ratio =
-                last_track_radius_ > 1.0
-                    ? std::abs(new_radius - last_track_radius_) / last_track_radius_
-                    : 0.0;
-            const double side_change_ratio =
-                last_side_ > 1.0
-                    ? std::abs(out_side - last_side_) / last_side_
-                    : 0.0;
-            if (radius_change_ratio > 0.50 || side_change_ratio > 0.50) {
-                // The geometrically-confirmed jump candidate is too different
-                // from the previous target — more likely a different blade or a
-                // false positive than the same target after ego-motion.
-                ROS_WARN_THROTTLE(
-                    0.5,
-                    "[BuffRecognizer] 跳变几何拒绝: radius Δ=%.0f%% side Δ=%.0f%% "
-                    "(old_R=%.1f new_R=%.1f old_side=%.1f new_side=%.1f)",
-                    radius_change_ratio * 100.0, side_change_ratio * 100.0,
-                    last_track_radius_, new_radius, last_side_, out_side);
-                stabilizer_.clearPendingJump();
-                out_R_center = last_R_center_;
-                out_Fan_center = last_Fan_center_;
-                out_side = last_side_;
-                out_corners = last_corners_;
-                return true;
-            }
-            ROS_INFO("[BuffRecognizer] 跳变确认, 接受新位置: fan=%.1f r=%.1f", dist_fan, dist_r);
-        } else {
-            jump_reject_cnt_ = 0;
-            stabilizer_.clearPendingJump();
-        }
-    }
-
-    const BuffStabilizedGeometry stabilized = stabilizeDetection(
-        raw_r_center, raw_fan_center, raw_corners);
-    out_R_center = {stabilized.r_center.x, stabilized.r_center.y};
-    out_Fan_center = {stabilized.fan_center.x, stabilized.fan_center.y};
     out_corners.clear();
-    for (const BuffPoint& corner : stabilized.corners) {
-        out_corners.emplace_back(corner.x, corner.y);
-    }
-
-    // 保存状态
-    last_R_center_   = out_R_center;
+    for (const auto& p : geometry.corners) out_corners.emplace_back(p.x, p.y);
+    last_R_center_ = out_R_center;
     last_Fan_center_ = out_Fan_center;
-    last_side_       = out_side;
-    last_track_radius_ = radius;
-    last_corners_    = out_corners;
-    // ★ 检测框 EMA 平滑, 抑制 YOLO 模型帧间抖动
-    if (has_prev_) {
-        last_R_box_.x      += box_alpha_ * (selected.rect.x      - last_R_box_.x);
-        last_R_box_.y      += box_alpha_ * (selected.rect.y      - last_R_box_.y);
-        last_R_box_.width  += box_alpha_ * (selected.rect.width  - last_R_box_.width);
-        last_R_box_.height += box_alpha_ * (selected.rect.height - last_R_box_.height);
-    } else {
-        last_R_box_ = selected.rect;
-    }
-    has_prev_        = true;
-    if (target_priority_locked_) {
-        target_lock_.accept({out_Fan_center.x, out_Fan_center.y}, now_seconds);
-    }
-
-    // 延迟统计 (1秒打印一次, 避免刷屏)
-    double t_freq = cv::getTickFrequency();
-    double et_yolo   = (t_yolo_end - t_yolo_start) * 1000.0 / t_freq;
-    double et_refine = (t_refine_end - t_refine_start) * 1000.0 / t_freq;
-    double et_total  = et_yolo + et_refine;
-    ROS_INFO_THROTTLE(1.0, "[BuffRecognizer] identify耗时: total=%.1fms (yolo=%.1fms  refine=%.1fms)", et_total, et_yolo, et_refine);
+    last_side_ = out_side;
+    last_corners_ = out_corners;
+    last_R_box_ = selected.rect;  // Draw the current observation without box EMA lag.
+    has_prev_ = true;
+    fresh_observation_ = true;
+    ROS_INFO_THROTTLE(1.0, "[BUFF_TARGET] blade=%d candidates=%zu switched=%s",
+                     association_.lockedId(), detections_.size(),
+                     association_result_.changed ? "true" : "false");
     return true;
 }
 
 // ====== 可视化 ======
 // R中心(红圆) 扇叶中心(绿圆) PnP角点(黄圆) 检测框(白框) side值(文字)
 void BuffRecognizer::visual(cv::Mat& frame) {
-    if (!has_prev_) return;
+    for (std::size_t i = 0; i < detections_.size(); ++i) {
+        const auto& point = detections_[i].kpt[4];
+        const int id = i < association_result_.candidate_ids.size()
+            ? association_result_.candidate_ids[i] : -1;
+        cv::circle(frame, point, 5, cv::Scalar(180, 180, 180), 1);
+        cv::putText(frame, cv::format("ID:%d", id), point + cv::Point2f(8, -8),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(180, 180, 180), 1);
+    }
+    if (!fresh_observation_) return;
 
     // R中心: 红色实心圆 + 坐标
     cv::circle(frame, last_R_center_, 4, cv::Scalar(0, 0, 255), -1);
     cv::putText(frame,
         cv::format("R:%d,%d", (int)last_R_center_.x, (int)last_R_center_.y),
-        cv::Point(15, 30), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 255), 2);
+        cv::Point(15, 220), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 255), 2);
 
     // 扇叶中心: 绿色实心圆 + 坐标
     cv::circle(frame, last_Fan_center_, 4, cv::Scalar(0, 255, 0), -1);
     cv::putText(frame,
         cv::format("Fan:%d,%d", (int)last_Fan_center_.x, (int)last_Fan_center_.y),
-        cv::Point(15, 60), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+        cv::Point(15, 250), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
 
     // 4个PnP角点: 黄色小圆
     for (size_t i = 0; i < last_corners_.size(); ++i) {
@@ -712,5 +465,5 @@ void BuffRecognizer::visual(cv::Mat& frame) {
     // side 值
     cv::putText(frame,
         cv::format("side:%.1f", last_side_),
-        cv::Point(15, 90), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 0), 2);
+        cv::Point(15, 280), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 0), 2);
 }
