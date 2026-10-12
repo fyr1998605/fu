@@ -544,9 +544,8 @@ void doserial(const rm_msgs::RmSerialConstPtr serail)
             "[BUFF_DELAY] 视觉链路 实测=%.1f ms 生效=%.1f ms, 电控=%.1f ms | "
             "总提前量=%.1f ms (其中弹丸飞行 %.1f ms)",
             vision_delay_measured_seconds * 1000.0,
-            (vision_delay_auto && vision_delay_ema_seconds > 0.0
-                 ? vision_delay_ema_seconds : vision_delay_seconds) * 1000.0,
-            ec_delay_seconds * 1000.0,
+            buffVisionProcessingDelaySeconds() * 1000.0,
+            buffCommandTimespanSeconds() * 1000.0,
             delta_t_ * 1000.0,
             pnpSolver_gravity->time_parameter * 1000.0);
     }

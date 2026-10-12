@@ -105,6 +105,28 @@ class FuConfigLayoutTest(unittest.TestCase):
             source,
         )
 
+    def test_buff_delay_components_are_independent(self):
+        config = FU_CONFIG.read_text(encoding="utf-8")
+        source = FU_SOURCE.read_text(encoding="utf-8")
+        runtime = (REPO_ROOT / "src" / "rm_tracker" / "include" /
+                   "buff_node_runtime.hpp").read_text(encoding="utf-8")
+
+        self.assertIn("buff_vision_delay_seconds: 0.10", config)
+        self.assertIn("buff_ec_delay_seconds: 0.05", config)
+        self.assertIn(
+            'private_nh.param<double>("buff_vision_delay_seconds"', source)
+        self.assertIn(
+            'private_nh.param<double>("buff_ec_delay_seconds"', source)
+        self.assertIn("double buffVisionProcessingDelaySeconds()", source)
+        self.assertIn("double buffCommandTimespanSeconds()", source)
+        self.assertIn(
+            "buffVisionProcessingDelaySeconds() + buffCommandTimespanSeconds()",
+            source,
+        )
+        self.assertIn("std::isfinite(vision_delay_ema_seconds)", source)
+        self.assertIn("std::max(0.0, ec_delay_seconds)", source)
+        self.assertEqual(runtime.count("buffTotalLeadCompensation()"), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

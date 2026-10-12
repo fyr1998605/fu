@@ -189,13 +189,30 @@ double vision_delay_measured_seconds = -1.0; // 最近一次实测值(调试用)
 constexpr double kVisionDelayMinSeconds = 0.005;  // 实测值合理区间下界(5ms)
 constexpr double kVisionDelayMaxSeconds = 0.35;   // 实测值合理区间上界(350ms)
 
-// 总时间补偿(秒): 视觉链路 + 电控。所有 delta_t_ 的计算都走这里。
+// 与自瞄相同, 先分别取视觉处理延迟和电控指令执行延迟, 再合成总提前量。
+// buff_ec_delay_seconds 对应自瞄的 COMMAND_TIMESPAN; 它不会被视觉 EMA 覆盖。
+double buffVisionProcessingDelaySeconds()
+{
+    const double effective_vision_delay =
+        vision_delay_auto && std::isfinite(vision_delay_ema_seconds) &&
+                vision_delay_ema_seconds > 0.0
+            ? vision_delay_ema_seconds
+            : vision_delay_seconds;
+    return std::max(0.0, effective_vision_delay);
+}
+
+// 能量机关没有独立的串口响应测量, 因此该值由现场标定,
+// 语义对应自瞄的 COMMAND_TIMESPAN。
+double buffCommandTimespanSeconds()
+{
+    return std::max(0.0, ec_delay_seconds);
+}
+
+// 总时间补偿(秒): 视觉处理延迟 + 电控指令执行延迟。
+// 所有 delta_t_ 的计算都通过此边界获取合计值。
 double buffTotalLeadCompensation()
 {
-    if (vision_delay_auto && vision_delay_ema_seconds > 0.0) {
-        return vision_delay_ema_seconds + ec_delay_seconds;
-    }
-    return vision_delay_seconds + ec_delay_seconds;
+    return buffVisionProcessingDelaySeconds() + buffCommandTimespanSeconds();
 }
 
 // 实测视觉链路延迟 = 当前时刻 - 图像时间戳(曝光时刻)。
@@ -390,10 +407,10 @@ int main(int argc, char *argv[])
     ROS_INFO("[Fu] Buff PnP K: fx=%.3f fy=%.3f cx=%.3f cy=%.3f",
              g_buff_camera_matrix[0], g_buff_camera_matrix[4],
              g_buff_camera_matrix[2], g_buff_camera_matrix[5]);
-    ROS_INFO("[Fu] 时间补偿: 视觉链路延迟=%.1f ms(%s), 电控延时=%.1f ms, 合计=%.1f ms",
-             vision_delay_seconds * 1000.0,
+    ROS_INFO("[Fu] 时间补偿: 视觉处理延迟=%.1f ms(%s), 电控指令延迟=%.1f ms, 合计=%.1f ms",
+             buffVisionProcessingDelaySeconds() * 1000.0,
              vision_delay_auto ? "实测" : "固定",
-             ec_delay_seconds * 1000.0,
+             buffCommandTimespanSeconds() * 1000.0,
              buffTotalLeadCompensation() * 1000.0);
 
     g_recognizer = new BuffRecognizer(buff_model_path, enemy_color);
