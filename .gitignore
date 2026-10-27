@@ -13,3 +13,13 @@ tmp/
 .cache/
 __pycache__/
 *.pyc
+
+# 第三方安装包 / 大压缩包，不入库（体积过大，push 会失败）
+*.tgz
+*.tgz.*
+*.tar.gz
+*.tar.xz
+*.deb
+*.rpm
+*.exe
+*.msi
