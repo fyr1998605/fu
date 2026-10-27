@@ -1,0 +1,24 @@
+<launch>
+    <!-- ================== 参数声明 ================== -->
+    <!-- 配置文件路径 -->
+    <arg name="fu_config" default="$(find rm_tracker)/config/rm_fu.yaml" />
+
+    <!-- YOLO / 模型路径 (由 start_fan.launch 传入) -->
+    <arg name="r_model_path"    default="$(find rm_tracker)/../../Model/fu_moxi/R_best.onnx" />
+    <arg name="fan_model_path"  default="$(find rm_tracker)/../../Model/fu_moxi/Fan_best.onnx" />
+    <arg name="buff_model_path" default="$(find rm_tracker)/../../Model/fu_moxi/buff_repvgg.xml" />
+
+    <!-- ================== Fu 节点 ================== -->
+    <node pkg="rm_tracker" type="Fu" name="Fu" respawn="true" output="screen">
+        <!-- 配置文件路径 -->
+        <param name="fu_config_path" value="$(arg fu_config)" />
+
+        <!-- 模型路径 -->
+        <param name="r_model_path"    value="$(arg r_model_path)" />
+        <param name="fan_model_path"  value="$(arg fan_model_path)" />
+        <param name="buff_model_path" value="$(arg buff_model_path)" />
+
+        <!-- 加载 yaml 配置(里面可能也有 model_path 之类的字段) -->
+        <rosparam file="$(arg fu_config)" command="load" />
+    </node>
+</launch>

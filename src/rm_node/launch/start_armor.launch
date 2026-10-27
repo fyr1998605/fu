@@ -1,0 +1,8 @@
+<launch>
+    <!-- ================================================
+         start_armor.launch — 同 start.launch
+         运行: roslaunch rm_node start_armor.launch
+         同时启动自瞄+打符全节点, 串口 ShootFlag 自动切换
+    ================================================ -->
+    <include file="$(find rm_node)/launch/start.launch"/>
+</launch>

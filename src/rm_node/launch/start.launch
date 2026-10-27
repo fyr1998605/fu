@@ -1,0 +1,43 @@
+<launch>
+    <!-- ================================================
+         start.launch — 统一启动 (自瞄 + 打符自动切换)
+
+         用法:
+           roslaunch rm_node start.launch                        # 默认装甲板模式
+           roslaunch rm_node start.launch sim_mode:=true shootflag_test:=f # 显式仿真能量机关
+           roslaunch rm_node start.launch sim_mode:=true           # 强制模拟模式
+
+         ShootFlag = 'a' → 装甲板: identify + tracker 工作, Fu 休眠
+         ShootFlag = 'f' → 能量机关: Fu 工作, identify + tracker 休眠
+
+         实车缺串口报错退出，由 launch 重试；仅 sim_mode:=true 启动仿真
+    ================================================ -->
+    <arg name="shootflag_test" default="a" />
+    <arg name="camp_test"       default="r" />
+    <arg name="sim_mode"        default="false" />
+    <arg name="fu_config"       default="$(find rm_tracker)/config/rm_fu.yaml" />
+
+    <rosparam file="$(find rm_node)/config/camera.yaml" command="load"/>
+
+    <!-- 相机 (公共) -->
+    <include file="$(find rm_hikcamera)/launch/rm_hikcamera.launch"/>
+
+    <!-- 串口: 默认真实硬件，仿真须显式选择 -->
+    <include file="$(find rm_serial)/launch/rm_serial.launch">
+        <arg name="shootflag_test" value="$(arg shootflag_test)" />
+        <arg name="camp_test"       value="$(arg camp_test)" />
+        <arg name="sim_mode"        value="$(arg sim_mode)" />
+    </include>
+
+    <!-- 装甲板识别 + 跟踪 -->
+    <include file="$(find rm_identify)/launch/rm_identify.launch"/>
+    <include file="$(find rm_tracker)/launch/rm_tracker.launch"/>
+
+    <!-- 能量机关 Fu 节点 (YOLO + 预测 + PnP) -->
+    <include file="$(find rm_tracker)/launch/rm_fu.launch">
+        <arg name="r_model_path"   value="$(find rm_tracker)/../../Model/fu_moxi/R_best.onnx" />
+        <arg name="fan_model_path" value="$(find rm_tracker)/../../Model/fu_moxi/Fan_best.onnx" />
+        <arg name="buff_model_path" value="$(find rm_tracker)/../../Model/fu_moxi/buff_repvgg.xml" />
+        <arg name="fu_config" value="$(arg fu_config)" />
+    </include>
+</launch>

@@ -1,0 +1,18 @@
+kp: 0.13
+ki: 0.003
+kd: 0.03
+dt: 1
+stresstest: false
+#k1 斜率 k2 面积比 k3 面积匹配
+yaw_k1: 0.6
+yaw_k2: 0.4
+yaw_k3: 1
+
+#卡尔曼参数
+s2qxyz_: 200.0
+s2qyaw_: 800.0
+s2qr_: 0.15
+r_xyz_factor: 0.02
+r_yaw: 0.005
+predict_s: 1.0
+fa_test: 1.8

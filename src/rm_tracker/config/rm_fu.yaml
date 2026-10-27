@@ -1,0 +1,346 @@
+# Fu-only configuration. Do not put armor auto-aim settings in this file.
+#
+# ========================= Fu 现场调参区 =========================
+# 修改本文件后直接运行: roslaunch rm_tracker rm_fu.launch
+# 角度使用弧度, 时间使用秒, 距离使用米或毫米(按参数名后缀)。
+
+# -------------------- 启动与识别 --------------------
+# 识别模型路径 换模型改这里
+buff_model_path: Model/fu_moxi/buff_repvgg.xml
+# 敌方颜色 blue/red 与裁判系统一致
+enemy_color: blue
+# 推理设备 GPU=核显(推荐, 比CPU快约2倍且显著降低CPU温度/调度抖动)
+#          CPU=纯CPU(无核显或GPU插件不可用时自动回退CPU)
+buff_inference_device: GPU
+# 大小符模式 small=小符 big=大符
+buff_move_mode: big
+# 选靶策略 locked=锁住当前目标不切换
+buff_target_priority: locked
+# 目标锁定超时(秒) 太小易切目标 太大丢目标后反应慢
+buff_target_lock_timeout_seconds: 0.25
+# 检测置信度阈值 调高更准但漏检 调低误检多
+buff_detector_conf_threshold: 0.2
+# NMS阈值 重叠框抑制力度 调大保留更多框
+buff_detector_nms_threshold: 0.2
+# 检测框平滑(0~1) 调大更稳但滞后 调小响应快但抖
+buff_stabilizer_alpha: 0.9
+# R中心二值化阈值(0~255) 环境亮调高 暗调低
+buff_r_center_binary_threshold: 120
+# R中心膨胀核大小 噪点多调大
+buff_r_center_dilate_kernel_size: 5
+# R中心掩膜比例 限制搜索范围
+buff_r_center_mask_ratio: 0.8
+# R中心轮廓搜索距离除数 值小搜得远
+buff_r_center_contour_distance_divisor: 3.0
+# R中心精修最大位移(px) 噪声大调小
+buff_r_center_refine_max_shift_px: 5.0
+
+# -------------------- 小符相位与选靶 --------------------
+# 相位收敛帧数 太小相位跳变 太大起手慢
+buff_small_converge_frames: 5
+# 最大滚动残差(弧度) 调小更严易拒检 调大容忍抖动
+buff_small_max_roll_residual_rad: 0.55
+# 最小转速(rad/s) 低于此判停转 调大更早判停
+buff_small_min_speed_radps: 0.052
+# 最大转速(rad/s) 高于此判异常 按符真实转速设
+buff_small_max_speed_radps: 1.571
+# 相位滤波过程噪声 调大跟得快但抖 调小平滑但滞后
+buff_small_process_noise: 0.005
+# 相位滤波测量噪声 调大平滑但滞后 调小灵敏但抖
+buff_small_measurement_noise: 0.004
+# 锚点确认帧数 连续几帧锁定锚点 调大更稳但起手慢
+buff_small_anchor_confirm_frames: 2
+# 相位最大间隔(秒) 超时丢相位 调大抗丢
+buff_small_max_gap_seconds: 0.5
+# 最大连续拒检帧数 超限重置 调大更宽容
+buff_small_max_rejected_frames: 3
+# 相位历史窗口大小 供平滑/预测用
+buff_small_phase_history_max_size: 20
+# 叶片关联门限(弧度) 两帧匹配最大角差 调小防误连但易丢
+buff_association_gate_rad: 0.30
+# 叶片半径比下限 超限判误检 调大更严
+buff_association_min_radius_ratio: 0.65
+# 叶片半径比上限 超限判误检 调小更严
+buff_association_max_radius_ratio: 1.5
+# 转速平滑系数 调大稳但响应慢 调小跟得快但抖
+buff_association_speed_smoothing: 0.35
+# 关联转速上限(rad/s) 防误关联噪声 按符转速上限设
+buff_association_speed_limit_radps: 3.0
+# 切换叶片确认帧数 防误切 调大更稳但切换慢
+buff_association_switch_confirm_frames: 3
+
+# -------------------- 大符预测门控 --------------------
+# 两路预测最大分歧(弧度 30°) 差太多判不可信 调小更严
+buff_big_prediction_max_disagreement_rad: 0.523599
+# 预测攒够帧数 调大更稳但起手更慢
+buff_big_prediction_acquire_frames: 3
+# 最大提前角(弧度) 提前量上限 打不中就调大
+buff_big_prediction_max_lead_rad: 2
+# 提前角单步增量(弧度) 防提前量突变 调小更平缓
+buff_big_prediction_max_lead_step_rad: 0.35
+
+# -------------------- 角度补偿与输出保护 --------------------
+# pitch补偿 减小往下 增大往上 麦轮: -0.075 英雄: 0.12 全向: 0.0225
+buff_pitch_compensation_rad:  -0.065
+# yaw补偿 增大往左 减小往右 打点左右偏就试射改
+buff_yaw_compensation_rad: -0.005
+# pitch输出上限(弧度 22°) 防云台过冲 调小更保守
+buff_pitch_max_rad: 0.383972
+# pitch输出下限(弧度 -15°) 防下压过深
+buff_pitch_min_rad: -0.261799
+# 卡死判定阈值(弧度 19°) 期望与实际角差超此判卡 调小易误触发
+buff_stuck_threshold_rad: 0.331613
+# 卡死触发帧数 连续卡住多少帧触发恢复 调小反应快但易误触发
+buff_stuck_trigger_frames: 30
+# 卡死恢复帧数 恢复正常输出所需帧 调小恢复快
+buff_recovery_frames: 15
+# 卡死恢复下压角(弧度 -10°) 恢复时云台下压量
+buff_recovery_pitch_rad: -0.174533
+# 弹道解算最大迭代 不收敛就调大
+buff_ballistic_max_iterations: 30
+# 默认弹速(m/s) 电控未上报弹速时的兜底 弹速不准改这里
+buff_ballistic_default_speed_mps: 24.0
+# 重力加速度(m/s²) 一般不动
+buff_ballistic_gravity_mps2: 9.8
+# 弹道最大仰角(弧度) 限制高抛 调小更保守
+buff_ballistic_max_pitch_rad: 0.51836
+# 弹道高度容差(m) 迭代收敛判定 调大收敛快但精度低
+buff_ballistic_height_tolerance_m: 0.0001
+# 弹道最大高度误差(m) 超差判无解 调大更宽容
+buff_ballistic_max_height_error_m: 0.01
+
+# -------------------- 大符 RANSAC --------------------
+# RANSAC最大迭代 调大更稳但更慢
+buff_big_ransac_max_iterations: 200
+# RANSAC拟合阈值 点到模型容差 调大容忍离群点
+buff_big_ransac_threshold: 0.5
+# 大符转速搜索下限(rad/s) 按符实际转速设
+buff_big_ransac_min_omega: 1.884
+# 大符转速搜索上限(rad/s) 必须覆盖符的真实转速
+buff_big_ransac_max_omega: 2.0
+# 大符振幅搜索下限(弧度) 按符实际振幅设
+buff_big_ransac_min_amplitude: 0.780
+# 大符振幅搜索上限(弧度) 必须覆盖符的真实振幅
+buff_big_ransac_max_amplitude: 1.045
+# 随机种子 固定保证结果可复现 调参时别乱改
+buff_big_ransac_random_seed: 24301
+# 最小内点数 不足判拟合失败 调小易误拟合 调大更严
+buff_big_ransac_min_inliers: 100
+# 每N个点拟合一次 降采样提速 调大更快但精度低
+buff_big_ransac_fit_every_n_samples: 5
+# 最大绝对转速(rad/s) 超速判异常 调小更严
+buff_big_ransac_max_abs_speed: 3.2
+# 数据最大间隔(秒) 断档超时重置 调大抗丢
+buff_big_ransac_max_gap_seconds: 5.0
+# 最大连续拒绝次数 超限重置 调大更宽容
+buff_big_ransac_max_consecutive_rejections: 30
+
+# -------------------- 显示与诊断 --------------------
+# 显示调试窗口 现场调参开true 比赛关false
+buff_show_image: true
+# 发布调试图像话题 需要远程查看开true
+buff_publish_debug_image: false
+# 慢帧阈值(ms) 超时打印掉帧警告 调小警告更频繁
+buff_slow_frame_ms: 50.0
+
+# Fu PnP calibration: adjust target width/height, camera matrix, and distortion below.
+# 目标宽度(mm) 量实际装甲板尺寸 影响PnP测距 偏小测距偏近
+buff_target_width_mm: 300.0
+# 目标高度(mm) 同上
+buff_target_height_mm: 300.0
+# 相机内参矩阵 标定所得 换相机才改
+buff_camera_matrix: [1724.18353097744, -0.000579628569003521  , 680.697138243768, 0.0,  1726.83294106563,  504.398280989468, 0.0, 0.0, 1.0]
+# 相机畸变系数 标定所得 换相机才改
+buff_dist_coeffs: [-0.0834722705527182, 0.496852388408421    , -0.000457625756594158  ,  0.00246230944307382, -0.0130632578222697]
+
+# ============================================================
+#  时间补偿: 总提前量 = 子弹飞行时间 + 视觉链路延迟 + 电控延时
+# ============================================================
+# 预测相位是在「图像曝光时刻」测到的, 弹丸却要等到这几段延时走完才飞出去:
+#
+#   t_impact = t_exposure + 视觉链路延迟 + 电控延时 + 子弹飞行时间
+#
+# 少补一段, 打点就滞后一个**常值角度**(60°/s 转速下, 少补 20ms = 滞后 1.2°,
+# 而且不随距离变化, 标定时表现为"永远慢半拍")。补多了则整体超前。
+# 飞行时间由弹道解算自动算(弹速取自电控上报的 BulletVec), 下面两项是人工标定。
+#
+# 【现场标定方法】
+# ① 把 buff_vision_delay_auto 打开, 跑一局看日志里的
+#    `[BUFF_DELAY] 视觉链路 实测=xx ms` —— 这就是你相机的真实链路耗时。
+# ② 把它填进 buff_vision_delay_seconds, 再把 auto 关掉(固定值更稳, 不受
+#    偶尔的推理卡顿影响)。
+# ③ 电控延时找电控问: /auto_angle 下发到云台真正转到指令角/弹丸出膛要多久。
+#    问不到就按"串口周期 + 云台阶跃响应"估, 50Hz 串口 + 快云台约 30~50ms。
+#
+# 标定后的验证: 打靶时若打点系统性滞后 → 调大; 系统性超前 → 调小。
+# 注意只改这两项, 不要再去动弹道部分。
+
+buff_vision_delay_seconds: 0.10
+  # [视觉] 固定视觉链路延迟(秒): 曝光 → 相机传输 → ROS 队列 → YOLO推理 → PnP → 下发
+  # 典型值: 全局快门 + OpenVINO CPU 推理, 30~80ms。默认 0.10 = 老代码里
+  # delta_t_compensation(0.15) 拆出来的视觉那一半, 保持原先的打点手感。
+buff_ec_delay_seconds: 0.20
+  # [电控] 固定电控延时(秒): 下发 → 串口 → 电控解算 → 云台到位/发弹
+  # 默认 0.05, 与上面相加正好等于老代码硬编码的 0.15。调这个之前先问电控。
+buff_vision_delay_auto: false
+  # [开关] true = 用图像时间戳实测视觉链路延迟(EMA平滑)代替上面的固定值。
+  # 好处是自动跟上相机/推理的负载变化; 代价是偶发卡顿会短暂影响提前量。
+  # 回放 bag 或相机时钟与主机不同源时, 实测值会超出合理区间, 自动回落到
+  # 固定值并打 WARN, 不会把提前量带飞。标定完建议关掉。
+
+# ============================================================
+#        能量机关 世界坐标系 EKF (扩展卡尔曼滤波) 完整参数手册
+# ============================================================
+# 状态向量 X = [center_x, center_y, normal_angle, omega]
+#   center_x/y : 能量机关旋转中心在世界坐标系下的 2D 坐标 (米)
+#   normal     : 能量机关平面的法向量角度 (弧度)
+#   omega      : 绕旋转中心的角速度 (弧度/秒)
+#
+# 预测步骤: X_k = F * X_{k-1}
+#   匀速模型: center 匀速移动, normal 不变, omega 不变
+#   phase 通过 omega * dt 积分
+#
+# 更新步骤: 用 PnP 解算的测量值修正预测值
+#   K = P * H^T * (H * P * H^T + R)^{-1}  <-- 卡尔曼增益
+#   X = X + K * (z_measured - z_predicted)
+# ============================================================
+
+# -------------------- 开关 & 物理参数 --------------------
+buff_world_ekf_enabled: false                  # [开关] 是否启用 EKF, false 则直接用 PnP 原始值
+buff_world_ekf_control_enabled:  false         # [开关] EKF 控制输入(云台反馈)是否启用
+buff_world_ekf_primary: false                   # [输出] false=旁路诊断, true=允许EKF接管主输出
+buff_quaternion_is_imu_to_map: true           # [方向] 四元数旋转方向, 一般不改
+buff_imu_stamp_offset_seconds: 0.0            # 校正IMU戳=消息戳+此偏移；避免与驱动重复补偿
+# IMU历史缓冲(秒) 时间同步对齐用 一般不动
+buff_imu_history_seconds: 0.5
+# IMU帧最大间隔(秒) 超间隔判断帧 调大更宽容
+buff_max_imu_bracket_gap_seconds: 0.03
+# 等待IMU最大时长(秒) 超时用旧数据 调大更稳但延迟高
+buff_max_imu_wait_seconds: 0.05
+# 控制超时(秒): 超过该时间没有新的有效角度下发才判"目标丢失"并停火。
+# 必须大于正常帧间隔(30fps约33ms), 否则普通调度抖动也会反复触发 aiming disabled。
+buff_control_timeout_seconds: 0.15
+# Aligned debug/reprojection frames preserve the source image header stamp.
+buff_radius_mm: 650.00                        # [尺寸] 能量机关半径(mm), 中心→装甲板距离
+buff_hub_normal_offset_mm: 0.0                # [尺寸] 中心hub法向偏移(mm), 一般=0
+
+# One prediction model per mode: small = pixel Kalman, big = RANSAC sine.
+# Warm-up or rejected observations produce no predicted aim point.
+# ============================================================
+#  观测噪声 R (Measurement Noise) —— "PnP 测量值有多不准?"
+# ============================================================
+# 物理含义: PnP 解算结果的噪声方差, 由相机标定精度、检测精度决定
+#
+# 调大 R → 卡尔曼增益 K 变小 → EKF "不相信"测量 → 输出平滑但滞后
+# 调小 R → 卡尔曼增益 K 变大 → EKF "相信"测量   → 输出灵敏但抖动
+#
+# 症状诊断:
+#   ✗ 输出跟不上目标旋转 → 观测噪声太大, 应减小 R
+#   ✗ 输出在目标附近抖动 → 观测噪声太小, 应增大 R
+
+buff_world_center_measurement_std_m: 0.015
+  # [观测噪声-R] 中心位置测量标准差(米)
+  # PnP 解算出的旋转中心的"可信度"
+  # 0.01=很信PnP中心 / 0.05=不太信PnP中心
+  # 推荐: 0.015 ~ 0.05
+
+buff_world_normal_measurement_std_rad: 0.030
+  # [观测噪声-R] 法向量角度测量标准差(弧度)
+  # PnP 解算出的平面朝向的"可信度"
+  # 推荐: 0.02 ~ 0.10
+
+buff_world_phase_measurement_std_rad: 0.05
+  # [观测噪声-R] 相位角测量标准差(弧度)  ★ 最敏感参数之一
+  # PnP 解算出的当前旋转角度的"可信度"
+  # 相位最难从单帧精确测量, 这个值通常设得比 center/normal 大
+  # 0.05=很信PnP相位(但可能闪烁) / 0.40=更多靠角速度积分预测相位
+  # 推荐: 0.05 ~ 0.40
+
+# ============================================================
+#  过程噪声 Q (Process Noise) —— "匀速运动模型有多不准?"
+# ============================================================
+# 物理含义: 模型预测的"不确定性" (单位时间的累积误差)
+#
+# 调大 Q → 卡尔曼增益 K 变大 → EKF "不相信"匀速模型 → 响应快但可能震荡
+# 调小 Q → 卡尔曼增益 K 变小 → EKF "相信"匀速模型 → 平滑但跟不上机动
+#
+# 症状诊断:
+#   ✗ 能量机关加减速时输出跟不上 → 过程噪声太小, 应增大 Q
+#   ✗ 能量机关匀速时输出也抖动 → 过程噪声太大, 应减小 Q
+
+buff_world_center_process_std_mps: 0.015
+  # [过程噪声-Q] 中心位置的过程噪声谱密度开根号(米/秒)
+  # 表示每秒钟中心"可能移动多少米"的不确定性
+  # 能量机关中心通常固定不动 → 这个值可以很小
+  # 0.005=中心基本不动 / 0.05=中心可能有明显移动
+  # 推荐: 0.005 ~ 0.05
+
+buff_world_normal_process_std_radps: 0.05
+  # [过程噪声-Q] 法向量角度的过程噪声谱密度开根号(弧度/秒)
+  # 表示每秒钟法向量"可能转多少弧度"的不确定性
+  # 法向量通常不变 → 可以设小
+  # 推荐: 0.005 ~ 0.10
+
+buff_world_omega_process_std_radps2: 0.40
+  # [过程噪声-Q] 角速度的过程噪声谱密度开根号(弧度/秒²)  ★★★ 最最重要!!!
+  # 表示每秒钟角速度"可能变化多少 rad/s"的不确定性
+  # 这是对跟踪效果影响最大的参数!
+  # 能量机关转速不是严格恒定的 (有摩擦、风阻、控制波动)
+  # 0.10=假设转速非常恒定, 平滑但跟不上转速变化
+  # 0.50=允许转速快速改变, 能跟上但可能震荡
+  # 推荐: 0.10 ~ 0.50
+  # 大能量机关(转速变化大) → 设大些 0.3~0.5
+  # 小能量机关(转速稳定)   → 设小些 0.1~0.25
+
+# ============================================================
+#  调参决策树 (按顺序来!)
+# ============================================================
+# ① 先确认 EKF 确实在运行:
+#    看 ROS_INFO 输出 "World EKF: enabled"
+#
+# ② 观察图像上投影点的行为:
+#    投影点滞后(跟在目标后面跑) → 检查下面③
+#    投影点抖动(在目标周围跳来跳去) → 检查下面④
+#    投影点完全没变化(改了参数也不变) → EKF可能没生效!
+#
+# ③ 投影滞后 → 减小观测噪声 或 增大过程噪声:
+#    优先: 减小 buff_world_phase_measurement_std_rad (如 0.20→0.10)
+#    其次: 增大 buff_world_omega_process_std_radps2 (如 0.25→0.40)
+#
+# ④ 投影抖动 → 增大观测噪声 或 减小过程噪声:
+#    优先: 增大 buff_world_phase_measurement_std_rad (如 0.20→0.35)
+#    其次: 减小 buff_world_omega_process_std_radps2 (如 0.40→0.20)
+#
+# ⑤ 如果怎么改都没变化 → 说明图像上画的不是 EKF 结果!
+#    可能是直接画了 PnP 原始解算点, 或者 EKF 被跳过(ekf_enabled=false)
+# ============================================================
+
+# Fu coordinate conversion: camera -> IMU -> gun. Units are metres/radians.
+# 坐标转换标定(米/弧度) 测出来的机械安装尺寸 换车/拆装才改
+CoordinateTransformer:
+  'off':
+    # IMU→地图 平移(m) 机械安装尺寸
+    imu2Map_trans_off_x: 0.0
+    imu2Map_trans_off_y: 0.0
+    imu2Map_trans_off_z: 0.055
+    # 相机→IMU 旋转(弧度) 一般固定90°安装
+    cam2Imu_rpy_off_roll: -1.57079632679489661923
+    cam2Imu_rpy_off_pitch: 0.0
+    cam2Imu_rpy_off_yaw: -1.57079632679489661923
+    # 相机→IMU 平移(m) 机械安装尺寸
+    cam2Imu_trans_off_x: 0.135
+    cam2Imu_trans_off_y: 0.0
+    cam2Imu_trans_off_z: -0.012
+    # 枪管→IMU 旋转(弧度)
+    gun2Imu_rpy_off_roll: 0.0
+    gun2Imu_rpy_off_pitch: 0.0
+    gun2Imu_rpy_off_yaw: 0.0
+    # 枪管→IMU 平移(m) 机械安装尺寸
+    gun2Imu_trans_off_x: 0.14524
+    gun2Imu_trans_off_y: 0.0
+    gun2Imu_trans_off_z: -0.055
+
+# This Camera section is not used by the active Fu aiming path; do not tune it for Fu PnP.
+Camera:
+  camera_matrix: [1724.18353097744, -0.000579628569003521  , 680.697138243768, 0.0,  1726.83294106563,  504.398280989468, 0.0, 0.0, 1.0]
+  dist_coeffs: [-0.0834722705527182, 0.496852388408421    , -0.000457625756594158  ,  0.00246230944307382, -0.0130632578222697]

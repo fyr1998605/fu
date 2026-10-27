@@ -1,0 +1,4 @@
+<launch>
+  <test test-name="serial_timestamp_tests" pkg="rm_serial"
+        type="serial_timestamp_tests" time-limit="30"/>
+</launch>

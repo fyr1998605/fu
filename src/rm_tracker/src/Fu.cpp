@@ -1,0 +1,891 @@
+#include "opencv2/opencv.hpp"
+ #include <Eigen/Dense>
+ #include <cmath>
+ #include <stdexcept>
+ #include <random>
+ #include <algorithm>
+ #include <iostream>
+ #include <fstream>
+ #include <vector>
+ #include <deque>
+ #include <limits>
+ #include <string>
+ #include <array>
+ #include <ros/ros.h>
+ #include <cv_bridge/cv_bridge.h>
+ #include <sensor_msgs/Image.h>
+ #include <geometry_msgs/Vector3.h>
+ #include <image_transport/image_transport.h>
+ #include <camera_info_manager/camera_info_manager.h>
+ #include "Image.h"
+ #include "buff_recognizer.hpp"   // Buff识别器: YOLO11关键点模型
+ #include "blade_tracker.hpp"     // Small-buff phase tracking and prediction
+#include "buff_world_tracker.hpp"
+#include "buff_big_predictor.hpp"
+#include "buff_frame_timing.hpp"
+#include "buff_time_sync.hpp"
+#include "buff_control_state.hpp"
+#include "buff_display_frame_queue.hpp"
+#include <geometry_msgs/Vector3Stamped.h>
+ #include "CoorConverter.hpp"    // 坐标变换: 相机→IMU→枪管
+ #include "rm_msgs/RmSerial.h"
+#include <std_msgs/Float64.h>
+#include <std_msgs/Bool.h>
+
+ // 调试
+////////////////////////////
+#include <chrono>
+#include <cstdint>
+#include <thread>
+#include <atomic>
+#include <ros/callback_queue.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
+////////////////////////////
+
+using namespace cv;
+using namespace std;
+
+
+rm_msgs::RmSerial RmSerialData;
+rm_msgs::RmSerial g_frame_serial_data;
+
+// Energy-mechanism runtime settings. The detector, coordinate calibration and
+// serial message schema remain unchanged; drivers now publish receipt stamps.
+bool g_buff_world_ekf_enabled = false;
+bool g_buff_world_ekf_control_enabled = false;
+bool g_buff_world_ekf_primary = false;
+bool g_quaternion_is_imu_to_map = true;
+bool g_buff_show_image = true;
+double g_buff_slow_frame_ms = 50.0;
+BuffFrameTiming g_buff_frame_timing;
+
+// The aiming path intentionally consumes only the newest frame.  Displaying
+// images has a separate callback queue and worker thread so a slow inference
+// iteration cannot freeze either window.
+ros::CallbackQueue g_display_callback_queue;
+BuffDisplayFrameQueue g_raw_display_queue(8);
+BuffDisplayFrameQueue g_processed_display_queue(8);
+std::atomic<std::uint64_t> g_display_sequence{0};
+std::atomic<bool> g_display_running{true};
+
+// Rotation direction of the selected motion model.
+// +1 = polar angle increases over time (clockwise in OpenCV image space)
+// -1 = polar angle decreases over time
+//  0 = unknown / not yet determined
+int g_buff_rotation_sign = 0;
+double g_imu_stamp_offset_seconds = 0.0;
+
+double g_buff_target_width_mm = 300.0;
+double g_buff_target_height_mm = 300.0;
+// The Buff PnP calibration is independent from the cam2Imu/gun2Imu
+// extrinsics. Defaults match the active infantry camera calibration.
+std::vector<double> g_buff_camera_matrix{
+   1724.18353097744, -0.000579628569003521  , 680.697138243768, 0.0,  1726.83294106563,  504.398280989468, 0.0, 0.0, 1.0};
+std::vector<double> g_buff_dist_coeffs{
+    -0.0834722705527182, 0.496852388408421    , -0.000457625756594158  ,  0.00246230944307382, -0.0130632578222697};
+BuffWorldTrackerConfig g_buff_world_config;
+BuffWorldTracker g_buff_world_tracker;
+
+// Every energy-mechanism frame must use the IMU pose measured at the same time.
+// The direct and inverse quaternion conventions are both logged before one is chosen.
+struct TimedImuPose {
+    ros::Time stamp;
+    Eigen::Quaterniond imu_to_map;
+    double raw_norm = 0.0;
+};
+
+BuffTimeSyncConfig g_buff_time_sync_config;
+// Separate from the 50ms IMU bracket wait: at 30fps the normal output interval
+// is ~33ms, so reusing the IMU wait as the control deadline made aiming drop
+// out on ordinary scheduling jitter. This only bounds "camera/vision is gone".
+double g_buff_control_timeout_seconds = 0.15;
+BuffTimeSynchronizer g_buff_time_sync;
+BuffControlState g_buff_control_state;
+TimedImuPose g_frame_imu_pose;
+ros::Time g_frame_image_stamp;
+std_msgs::Header g_frame_header;
+// Observation time follows /clock in simulation and sensor header time on the vehicle.
+double g_frame_time_seconds = 0.0;
+bool g_buff_prediction_ready = false;
+int g_buff_stuck_frames = 0;
+bool g_buff_recovery_active = false;
+int g_buff_recovery_remaining = 0;
+bool g_buff_sync_waiting = false;
+bool g_buff_publish_debug_image = false;
+std::uint64_t g_frame_sequence = 0;
+std::uint64_t g_received_frame_sequence = 0;
+std::uint64_t g_prepared_frame_sequence = 0;
+std::uint64_t g_processed_frame_sequence = 0;
+bool g_has_frame_imu_pose = false;
+double g_frame_imu_image_skew_seconds = std::numeric_limits<double>::quiet_NaN();
+ros::Publisher g_buff_pose_time_error_pub;
+ros::Publisher g_buff_sync_bracket_pub;
+ros::Publisher g_buff_debug_image_pub;
+struct BufferedBuffImage {
+    cv_bridge::CvImageConstPtr pixels;
+    std_msgs::Header header;
+    std::uint64_t sequence = 0;
+};
+std::deque<BufferedBuffImage> g_pending_buff_images;
+ros::Time g_last_received_image_stamp;
+
+// ═══ Buff 识别器全局对象 + 结果缓存 ═══
+// g_recognizer: main()中创建, Fu_Task()中使用
+// 模型路径+敌方颜色通过 ROS param: buff_model_path, enemy_color
+// 标签映射: enemy_color → enemy_class_idx_
+//   "blue" → 0 → tensor行4(class 0=red)  "red" → 1 → tensor行5(class 1=blue)
+// 结果流向: g_R_center/g_Fan_center→所选运动模型, g_side→PnPSolver_gravity
+// 详细文档见 README_buff_upgrade.md
+BuffRecognizer* g_recognizer = nullptr;
+// 识别结果缓存
+cv::Point2f g_R_center   = {0, 0};    // R中心 (旋转圆心, CV精化)
+cv::Point2f g_Fan_center = {0, 0};    // 扇叶中心 (四边中点平均=靶心)
+double      g_side       = 0;          // 扇叶边长 = |顶边中点-底边中点|
+std::vector<cv::Point2f> g_corners;   // 4个PnP角点: [顶,左,底,右]边中点
+
+//重要参数
+char camp = 'r';//阵营
+std::string MoveMode = "small";//小符
+// std::string MoveMode = "big";//大符
+double fps = 30;
+
+
+
+
+
+#include "buff_pnp_solver.hpp"
+
+//前处理
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+geometry_msgs::Vector3 Angle;
+// rm_msgs::RmSerial RmSerialData;
+double Qtn[4];
+ros::Publisher PubAngle;
+ros::Publisher debugpub;            //debug发布者
+ros::Publisher debugpub1;           //debug1发布者
+ros::Publisher debugpub2;           //debug2发布者  (buff世界卡尔曼 omega)
+ros::Publisher debugpub3;           //debug3发布者  (buff世界卡尔曼 |K-M| px)
+ros::Publisher debugpub4;           //debug4发布者  (buff世界卡尔曼 |P-M| px)
+ros::Publisher world_ready_pub;     // /buff/world_ready 发布者
+ros::Publisher current_pitch_pub;   // /buff/current_pitch 发布者
+ros::Publisher current_yaw_pub;     // /buff/current_yaw 发布者
+ros::Publisher expected_pitch_pub;  // /buff/expected_pitch 发布者
+ros::Publisher expected_yaw_pub;    // /buff/expected_yaw 发布者
+ros::Publisher predicted_pitch_pub; // /buff/predicted_pitch 发布者
+ros::Publisher predicted_yaw_pub;   // /buff/predicted_yaw 发布者
+/*主程序*/
+
+bool init = false;//初始化标识符
+cv::Mat frame;//处理帧
+cv::Mat frame_;//接收帧
+bool functional = false;//Wait for the serial mode command before publishing Fu angles.
+double delta_t_ = 0.3;//差分时间
+
+// ═══ 时间补偿: 总提前量 = 子弹飞行时间 + 视觉链路延迟 + 电控延时 ═══
+// 相位与所有预测器的时间基准均来自图像 header.stamp；实车该时间是接收时间
+// 减去可配置的延迟估计，仿真使用 /clock。相位来自该源图像，而弹丸在
+//   t_impact = t_exposure + 视觉链路延迟(曝光→出角度)
+//                       + 电控延时(下发→云台到位/发弹)
+//                       + 子弹飞行时间
+// 命中。所以 delta_t_ 必须把这三段都算进去, 少一段打点就滞后一个固定角度
+// (60°/s 的转速下, 少补 20ms 就是 1.2° 的常值偏差, 而且不随距离变化)。
+//
+// 旧代码把后两段合并成一个硬编码的 0.15, 现场没法标、改了要重编译。
+// 现在拆成两个可配置项 + 一路视觉延迟实测。
+//
+// 视觉链路延迟: 曝光 → 相机传输 → ROS 队列 → YOLO 推理 → 跟踪/预测 → PnP → 下发。
+//   buff_vision_delay_auto=true 时用图像时间戳实测(EMA), 否则用固定值。
+// 电控延时: /auto_angle 下发 → 串口 → 电控解算 → 云台转到指令角 / 发弹出膛。
+//   这个量问电控要, 视觉这边测不了。
+double vision_delay_seconds = 0.10;     // 视觉链路延迟固定值(秒)
+double ec_delay_seconds     = 0.05;     // 电控延时固定值(秒)
+bool   vision_delay_auto    = false;    // true = 用图像时间戳实测视觉延迟
+double vision_delay_ema_seconds = -1.0; // 实测视觉延迟EMA(<0 = 还没测出来)
+double vision_delay_measured_seconds = -1.0; // 最近一次实测值(调试用)
+constexpr double kVisionDelayMinSeconds = 0.005;  // 实测值合理区间下界(5ms)
+constexpr double kVisionDelayMaxSeconds = 0.35;   // 实测值合理区间上界(350ms)
+
+// 与自瞄相同, 先分别取视觉处理延迟和电控指令执行延迟, 再合成总提前量。
+// buff_ec_delay_seconds 对应自瞄的 COMMAND_TIMESPAN; 它不会被视觉 EMA 覆盖。
+double buffVisionProcessingDelaySeconds()
+{
+    const double effective_vision_delay =
+        vision_delay_auto && std::isfinite(vision_delay_ema_seconds) &&
+                vision_delay_ema_seconds > 0.0
+            ? vision_delay_ema_seconds
+            : vision_delay_seconds;
+    return std::max(0.0, effective_vision_delay);
+}
+
+// 能量机关没有独立的串口响应测量, 因此该值由现场标定,
+// 语义对应自瞄的 COMMAND_TIMESPAN。
+double buffCommandTimespanSeconds()
+{
+    return std::max(0.0, ec_delay_seconds);
+}
+
+// 总时间补偿(秒): 视觉处理延迟 + 电控指令执行延迟。
+// 所有 delta_t_ 的计算都通过此边界获取合计值。
+double buffTotalLeadCompensation()
+{
+    return buffVisionProcessingDelaySeconds() + buffCommandTimespanSeconds();
+}
+
+// 实测视觉链路延迟 = 当前时刻 - 图像时间戳(曝光时刻)。
+// 必须在「下发角度之后」调用, 这样量到的就是本帧从曝光到出角度的完整链路耗时:
+// 相机传输 + ROS 队列积压 + YOLO 推理 + PnP 全部包含在内。EMA 平滑后供下一帧
+// 使用(本帧的 delta_t_ 在上游已经用掉了, 来不及改)。
+// 回放 bag / 相机与主机时钟不同源时量到的是垃圾值, 落在合理区间外就丢弃,
+// 回落到固定值, 不会把提前量带飞。
+void buffUpdateVisionDelayEstimate()
+{
+    if (g_frame_image_stamp.isZero()) {
+        return;  // 相机没给时间戳(header.stamp=0), 只能靠固定值
+    }
+    const double age = (ros::Time::now() - g_frame_image_stamp).toSec();
+    vision_delay_measured_seconds = age;
+    if (!std::isfinite(age) || age < kVisionDelayMinSeconds ||
+        age > kVisionDelayMaxSeconds) {
+        ROS_WARN_THROTTLE(
+            5.0,
+            "[BUFF_DELAY] 实测视觉延迟 %.1f ms 超出合理区间 [%.1f, %.1f] ms, "
+            "已忽略(继续用固定值 %.1f ms)",
+            age * 1000.0, kVisionDelayMinSeconds * 1000.0,
+            kVisionDelayMaxSeconds * 1000.0, vision_delay_seconds * 1000.0);
+        return;
+    }
+    vision_delay_ema_seconds = (vision_delay_ema_seconds < 0.0)
+        ? age
+        : 0.9 * vision_delay_ema_seconds + 0.1 * age;//EMA(约10帧时间常数)
+}
+
+double pitch_compensation = -0.06;//pitch补偿
+double yaw_compensation = 0.02;//yaw补偿
+double buff_pitch_max_rad = 22.0 * PI / 180.0;
+double buff_pitch_min_rad = -15.0 * PI / 180.0;
+double buff_stuck_threshold_rad = 19.0 * PI / 180.0;
+int buff_stuck_trigger_frames = 30;
+int buff_recovery_frames = 15;
+double buff_recovery_pitch_rad = -10.0 * PI / 180.0;
+int g_buff_ballistic_max_iterations = 30;
+double g_buff_ballistic_default_speed_mps = 24.0;
+double g_buff_ballistic_gravity_mps2 = 9.8;
+double g_buff_ballistic_max_pitch_rad = 0.165 * PI;
+double g_buff_ballistic_height_tolerance_m = 0.0001;
+double g_buff_ballistic_max_height_error_m = 0.01;
+BuffRecognizerConfig g_buff_recognizer_config;
+SmallBuffPhaseTracker::Config g_small_buff_config;
+buff_zju::BigBuffPredictionGateConfig g_big_prediction_gate_config;
+// double pitch_compensation = 0.0;//pitch补偿
+// double yaw_compensation = 0.0;//yaw补偿
+buff_zju::BigBuffPredictor g_big_buff_predictor;
+PnPSolver_gravity* pnpSolver_gravity = nullptr;;//创建重力补偿器
+CoordinateTransformer* g_coorConverter = nullptr;   //相机→枪管坐标变换
+SmallBuffPhaseTracker g_small_buff_tracker;
+
+//创建中间变量
+// ROS source time of the current image, in milliseconds.
+double time_milliseconds = 0;
+cv::Point2f final_angle_2D = {0, 0};//最终角度对应的图像点
+cv::Point2f euler_angles = {0, 0};//储存发送的空间角
+
+//串口订阅回调函数
+//作用：doserial是串口回调函数，拷贝电控云台、四元数姿态数据，接收指令切换视觉开关与红蓝阵营标识，控制能量机关视觉程序运行状态。
+//rm_msgs::RmSerial：自定义 ROS 串口消息包，存储云台编码器、电控下发的各类数据；
+//ConstPtr：只读智能指针，回调接收串口话题传来的数据；
+//serail：消息变量，存放云台 Pitch、Yaw 角度等电控回传信息；
+
+#include "buff_node_runtime.hpp"
+
+int main(int argc, char *argv[])
+{
+    ros::init(argc,argv,"Fu");
+    ros::NodeHandle nh;//创建节点句柄，用于发布话题、订阅话题、获取参数等
+
+    ros::NodeHandle private_nh("~");//创建私有节点句柄，用于获取私有参数等
+
+
+    // ═══ 加载 Buff 关键点模型 + 创建识别器 ═══
+    // 模型: YOLO11-pose, OpenVINO IR, [1,3,640,640]→[1,33,8400]
+    // 标签: enemy_color → enemy_class_idx_ (0=red行4, 1=blue行5)
+    // 构造函数: read_model→compile_model(CPU)→create_infer_request
+    // 详细文档见 README_buff_upgrade.md
+    std::string buff_model_path, enemy_color, fu_config_path;
+    std::string buff_target_priority;
+    double buff_target_lock_timeout_seconds = 0.25;
+    private_nh.param<std::string>("buff_model_path", buff_model_path,
+        "Model/fu_moxi/buff_repvgg.xml");
+    private_nh.param<std::string>("enemy_color", enemy_color, "blue");
+    private_nh.param<std::string>("fu_config_path", fu_config_path, "");
+    private_nh.param<std::string>("buff_target_priority",
+                                  buff_target_priority, "locked");
+    private_nh.param<double>("buff_target_lock_timeout_seconds",
+                             buff_target_lock_timeout_seconds, 0.25);
+    private_nh.param<float>("buff_detector_conf_threshold",
+                            g_buff_recognizer_config.detector_conf_threshold,
+                            0.2f);
+    private_nh.param<float>("buff_detector_nms_threshold",
+                            g_buff_recognizer_config.detector_nms_threshold,
+                            0.2f);
+    private_nh.param<std::string>("buff_inference_device",
+                                  g_buff_recognizer_config.inference_device,
+                                  g_buff_recognizer_config.inference_device);
+    private_nh.param<float>("buff_stabilizer_alpha",
+                            g_buff_recognizer_config.stabilizer_alpha, 0.9f);
+    private_nh.param<int>("buff_r_center_binary_threshold",
+                          g_buff_recognizer_config.binary_threshold, 120);
+    private_nh.param<int>("buff_r_center_dilate_kernel_size",
+                          g_buff_recognizer_config.dilate_kernel_size, 5);
+    private_nh.param<double>("buff_r_center_mask_ratio",
+                             g_buff_recognizer_config.r_center_mask_ratio, 0.8);
+    private_nh.param<double>("buff_r_center_contour_distance_divisor",
+                             g_buff_recognizer_config.r_center_contour_distance_divisor, 3.0);
+    private_nh.param<double>("buff_r_center_refine_max_shift_px",
+                             g_buff_recognizer_config.r_center_refine_max_shift_px, 5.0);
+    private_nh.param<double>("buff_association_gate_rad",
+                             g_buff_recognizer_config.association_gate_rad, 0.30);
+    private_nh.param<double>("buff_association_min_radius_ratio",
+                             g_buff_recognizer_config.association_min_radius_ratio, 0.65);
+    private_nh.param<double>("buff_association_max_radius_ratio",
+                             g_buff_recognizer_config.association_max_radius_ratio, 1.5);
+    private_nh.param<double>("buff_association_speed_smoothing",
+                             g_buff_recognizer_config.association_speed_smoothing, 0.35);
+    private_nh.param<double>("buff_association_speed_limit_radps",
+                             g_buff_recognizer_config.association_speed_limit_radps, 3.0);
+    private_nh.param<int>("buff_association_switch_confirm_frames",
+                          g_buff_recognizer_config.association_switch_confirm_frames, 3);
+    private_nh.param<int>("buff_small_converge_frames",
+                          g_small_buff_config.converge_frames, 5);
+    private_nh.param<double>("buff_small_max_roll_residual_rad",
+                             g_small_buff_config.max_roll_residual_rad, 0.55);
+    private_nh.param<double>("buff_small_min_speed_radps",
+                             g_small_buff_config.min_speed_radps, 0.052);
+    private_nh.param<double>("buff_small_max_speed_radps",
+                             g_small_buff_config.max_speed_radps, 1.571);
+    private_nh.param<double>("buff_small_process_noise",
+                             g_small_buff_config.process_noise, 0.005);
+    private_nh.param<double>("buff_small_measurement_noise",
+                             g_small_buff_config.measurement_noise, 0.004);
+    private_nh.param<int>("buff_small_anchor_confirm_frames",
+                          g_small_buff_config.anchor_confirm_frames, 2);
+    private_nh.param<double>("buff_small_max_gap_seconds",
+                             g_small_buff_config.max_gap_seconds, 0.5);
+    private_nh.param<int>("buff_small_max_rejected_frames",
+                          g_small_buff_config.max_rejected_frames, 3);
+    private_nh.param<int>("buff_small_phase_history_max_size",
+                          g_small_buff_config.phase_history_max_size, 20);
+    private_nh.param<double>("buff_big_prediction_max_disagreement_rad",
+                             g_big_prediction_gate_config.max_disagreement_rad,
+                             buff_zju::kBigPredictionMaxDisagreementRadians);
+    private_nh.param<int>("buff_big_prediction_acquire_frames",
+                          g_big_prediction_gate_config.acquire_frames,
+                          buff_zju::kBigPredictionAcquireFrames);
+    private_nh.param<double>("buff_big_prediction_max_lead_rad",
+                             g_big_prediction_gate_config.max_lead_rad,
+                             buff_zju::kBigPredictionMaxLeadRadians);
+    private_nh.param<double>("buff_big_prediction_max_lead_step_rad",
+                             g_big_prediction_gate_config.max_lead_step_rad,
+                             buff_zju::kBigPredictionMaxLeadStepRadians);
+    private_nh.param<double>("buff_pitch_compensation_rad", pitch_compensation, -0.06);
+    private_nh.param<double>("buff_yaw_compensation_rad", yaw_compensation, 0.02);
+    private_nh.param<double>("buff_pitch_max_rad", buff_pitch_max_rad,
+                             22.0 * PI / 180.0);
+    private_nh.param<double>("buff_pitch_min_rad", buff_pitch_min_rad,
+                             -15.0 * PI / 180.0);
+    private_nh.param<double>("buff_stuck_threshold_rad", buff_stuck_threshold_rad,
+                             19.0 * PI / 180.0);
+    private_nh.param<int>("buff_stuck_trigger_frames", buff_stuck_trigger_frames, 30);
+    private_nh.param<int>("buff_recovery_frames", buff_recovery_frames, 15);
+    private_nh.param<double>("buff_recovery_pitch_rad", buff_recovery_pitch_rad,
+                             -10.0 * PI / 180.0);
+    private_nh.param<int>("buff_ballistic_max_iterations",
+                          g_buff_ballistic_max_iterations, 30);
+    private_nh.param<double>("buff_ballistic_default_speed_mps",
+                             g_buff_ballistic_default_speed_mps, 24.0);
+    private_nh.param<double>("buff_ballistic_gravity_mps2",
+                             g_buff_ballistic_gravity_mps2, 9.8);
+    private_nh.param<double>("buff_ballistic_max_pitch_rad",
+                             g_buff_ballistic_max_pitch_rad, 0.165 * PI);
+    private_nh.param<double>("buff_ballistic_height_tolerance_m",
+                             g_buff_ballistic_height_tolerance_m, 0.0001);
+    private_nh.param<double>("buff_ballistic_max_height_error_m",
+                             g_buff_ballistic_max_height_error_m, 0.01);
+    g_buff_recognizer_config.detector_conf_threshold = std::clamp(
+        g_buff_recognizer_config.detector_conf_threshold, 0.0f, 1.0f);
+    g_buff_recognizer_config.detector_nms_threshold = std::clamp(
+        g_buff_recognizer_config.detector_nms_threshold, 0.0f, 1.0f);
+    g_buff_recognizer_config.stabilizer_alpha = std::clamp(
+        g_buff_recognizer_config.stabilizer_alpha, 0.0f, 1.0f);
+    g_buff_recognizer_config.binary_threshold = std::clamp(
+        g_buff_recognizer_config.binary_threshold, 0, 255);
+    g_buff_recognizer_config.dilate_kernel_size = std::max(
+        1, g_buff_recognizer_config.dilate_kernel_size);
+    g_buff_recognizer_config.r_center_mask_ratio = std::max(
+        0.0, g_buff_recognizer_config.r_center_mask_ratio);
+    g_buff_recognizer_config.r_center_contour_distance_divisor = std::max(
+        1e-6, g_buff_recognizer_config.r_center_contour_distance_divisor);
+    g_buff_recognizer_config.r_center_refine_max_shift_px = std::max(
+        0.0, g_buff_recognizer_config.r_center_refine_max_shift_px);
+    g_buff_recognizer_config.association_gate_rad = std::max(
+        0.0, g_buff_recognizer_config.association_gate_rad);
+    g_buff_recognizer_config.association_min_radius_ratio = std::max(
+        0.0, g_buff_recognizer_config.association_min_radius_ratio);
+    g_buff_recognizer_config.association_max_radius_ratio = std::max(
+        g_buff_recognizer_config.association_min_radius_ratio,
+        g_buff_recognizer_config.association_max_radius_ratio);
+    g_buff_recognizer_config.association_speed_smoothing = std::clamp(
+        g_buff_recognizer_config.association_speed_smoothing, 0.0, 1.0);
+    g_buff_recognizer_config.association_speed_limit_radps = std::max(
+        1e-6, g_buff_recognizer_config.association_speed_limit_radps);
+    g_buff_recognizer_config.association_switch_confirm_frames = std::max(
+        1, g_buff_recognizer_config.association_switch_confirm_frames);
+    g_small_buff_config.converge_frames = std::max(
+        1, g_small_buff_config.converge_frames);
+    g_small_buff_config.max_roll_residual_rad = std::max(
+        1e-6, g_small_buff_config.max_roll_residual_rad);
+    g_small_buff_config.min_speed_radps = std::max(
+        1e-6, g_small_buff_config.min_speed_radps);
+    g_small_buff_config.max_speed_radps = std::max(
+        g_small_buff_config.min_speed_radps, g_small_buff_config.max_speed_radps);
+    g_small_buff_config.process_noise = std::max(1e-9, g_small_buff_config.process_noise);
+    g_small_buff_config.measurement_noise = std::max(1e-9, g_small_buff_config.measurement_noise);
+    g_small_buff_config.anchor_confirm_frames = std::max(
+        1, g_small_buff_config.anchor_confirm_frames);
+    g_small_buff_config.max_gap_seconds = std::max(1e-4, g_small_buff_config.max_gap_seconds);
+    g_small_buff_config.max_rejected_frames = std::max(
+        1, g_small_buff_config.max_rejected_frames);
+    g_small_buff_config.phase_history_max_size = std::max(
+        1, g_small_buff_config.phase_history_max_size);
+    g_big_prediction_gate_config.max_disagreement_rad = std::max(
+        0.0, g_big_prediction_gate_config.max_disagreement_rad);
+    g_big_prediction_gate_config.acquire_frames = std::max(
+        1, g_big_prediction_gate_config.acquire_frames);
+    g_big_prediction_gate_config.max_lead_rad = std::max(
+        0.0, g_big_prediction_gate_config.max_lead_rad);
+    g_big_prediction_gate_config.max_lead_step_rad = std::max(
+        0.0, g_big_prediction_gate_config.max_lead_step_rad);
+    buff_stuck_trigger_frames = std::max(1, buff_stuck_trigger_frames);
+    buff_recovery_frames = std::max(1, buff_recovery_frames);
+    g_buff_ballistic_max_iterations = std::max(1, g_buff_ballistic_max_iterations);
+    g_buff_ballistic_default_speed_mps = std::max(1e-6, g_buff_ballistic_default_speed_mps);
+    g_buff_ballistic_gravity_mps2 = std::max(1e-6, g_buff_ballistic_gravity_mps2);
+    g_buff_ballistic_max_pitch_rad = std::max(1e-6, g_buff_ballistic_max_pitch_rad);
+    g_buff_ballistic_height_tolerance_m = std::max(1e-9, g_buff_ballistic_height_tolerance_m);
+    g_buff_ballistic_max_height_error_m = std::max(1e-9, g_buff_ballistic_max_height_error_m);
+    private_nh.param<bool>("buff_show_image", g_buff_show_image, true);
+    private_nh.param<double>("buff_slow_frame_ms", g_buff_slow_frame_ms, 50.0);
+    if (!std::isfinite(g_buff_slow_frame_ms) || g_buff_slow_frame_ms <= 0.0) {
+        g_buff_slow_frame_ms = 50.0;
+    }
+    private_nh.param<std::string>("buff_move_mode", MoveMode, MoveMode);
+    if (MoveMode != "small" && MoveMode != "big") {
+        ROS_FATAL("[Fu] Unsupported buff_move_mode='%s'; choose small or big", MoveMode.c_str());
+        return 1;
+    }
+
+    private_nh.param<bool>("buff_world_ekf_enabled", g_buff_world_ekf_enabled, false);//是否启用世界帧跟踪器
+    private_nh.param<bool>("buff_world_ekf_control_enabled",
+                           g_buff_world_ekf_control_enabled, false);//是否启用世界帧跟踪器控制
+    private_nh.param<bool>("buff_world_ekf_primary",
+                           g_buff_world_ekf_primary, false);
+
+    private_nh.param<bool>("buff_quaternion_is_imu_to_map",
+                           g_quaternion_is_imu_to_map, true);
+    private_nh.param<double>("buff_imu_stamp_offset_seconds",
+                             g_imu_stamp_offset_seconds, 0.0);
+    private_nh.param<double>("buff_imu_history_seconds",
+        g_buff_time_sync_config.history_seconds, 0.5);
+    private_nh.param<double>("buff_max_imu_bracket_gap_seconds",
+        g_buff_time_sync_config.max_bracket_gap_seconds, 0.03);
+    private_nh.param<double>("buff_max_imu_wait_seconds",
+        g_buff_time_sync_config.max_wait_seconds, 0.05);
+    private_nh.param<double>("buff_control_timeout_seconds",
+        g_buff_control_timeout_seconds, 0.15);
+    g_buff_control_timeout_seconds = std::clamp(
+        g_buff_control_timeout_seconds,
+        g_buff_time_sync_config.max_wait_seconds, 1.0);
+    private_nh.param<bool>("buff_publish_debug_image", g_buff_publish_debug_image, false);
+    g_buff_time_sync_config.imu_stamp_offset_seconds = g_imu_stamp_offset_seconds;
+    try {
+        g_buff_time_sync = BuffTimeSynchronizer(g_buff_time_sync_config);
+    } catch (const std::exception& error) {
+        ROS_FATAL("[Fu] %s", error.what());
+        return 1;
+    }
+    ROS_INFO("[Fu] Time sync: ROS image stamp, bracket<=%.1fms wait<=%.1fms "
+             "control_timeout=%.1fms history=%.3fs offset=%+.1fms",
+        g_buff_time_sync_config.max_bracket_gap_seconds * 1000.0,
+        g_buff_time_sync_config.max_wait_seconds * 1000.0,
+        g_buff_control_timeout_seconds * 1000.0,
+        g_buff_time_sync_config.history_seconds, g_imu_stamp_offset_seconds * 1000.0);
+
+    // ═══ 时间补偿参数(提前量 = 飞行时间 + 视觉链路延迟 + 电控延时) ═══
+    private_nh.param<double>("buff_vision_delay_seconds",
+                             vision_delay_seconds, 0.10);
+    private_nh.param<double>("buff_ec_delay_seconds",
+                             ec_delay_seconds, 0.05);
+    private_nh.param<bool>("buff_vision_delay_auto",
+                           vision_delay_auto, false);
+    // 负延时没有物理意义(会让提前量倒着算), 直接夹到 0
+    vision_delay_seconds = std::max(0.0, vision_delay_seconds);
+    ec_delay_seconds = std::max(0.0, ec_delay_seconds);
+    private_nh.param<double>("buff_target_width_mm", g_buff_target_width_mm, 300.0);
+    private_nh.param<double>("buff_target_height_mm", g_buff_target_height_mm, 300.0);
+    const std::vector<double> default_buff_camera_matrix = g_buff_camera_matrix;//默认相机矩阵
+    const std::vector<double> default_buff_dist_coeffs = g_buff_dist_coeffs;//默认畸变系数矩阵
+    private_nh.param<std::vector<double>>(
+        "buff_camera_matrix", g_buff_camera_matrix, default_buff_camera_matrix);//获取相机矩阵
+    private_nh.param<std::vector<double>>(
+        "buff_dist_coeffs", g_buff_dist_coeffs, default_buff_dist_coeffs);//获取畸变系数矩阵
+    if (g_buff_camera_matrix.size() != 9 || g_buff_dist_coeffs.size() != 5) {
+        ROS_FATAL("[Fu] Invalid Buff PnP calibration: camera matrix needs 9 values, distortion needs 5");
+        return 1;
+    }
+
+    double buff_radius_mm = 0.0;
+    double buff_hub_normal_offset_mm = 0.0;
+    private_nh.param<double>("buff_radius_mm", buff_radius_mm, 0.0);
+    private_nh.param<double>("buff_hub_normal_offset_mm",
+                             buff_hub_normal_offset_mm, 0.0);
+    private_nh.param<double>("buff_world_center_measurement_std_m",
+                             g_buff_world_config.center_measurement_std_m, 0.015);
+    private_nh.param<double>("buff_world_normal_measurement_std_rad",
+                             g_buff_world_config.normal_measurement_std_rad, 0.030);
+    private_nh.param<double>("buff_world_phase_measurement_std_rad",
+                             g_buff_world_config.phase_measurement_std_rad, 0.040);
+    private_nh.param<double>("buff_world_center_process_std_mps",
+                             g_buff_world_config.center_process_std_mps, 0.010);
+    private_nh.param<double>("buff_world_normal_process_std_radps",
+                             g_buff_world_config.normal_process_std_radps, 0.010);
+    private_nh.param<double>("buff_world_omega_process_std_radps2",
+                             g_buff_world_config.omega_process_std_radps2, 0.250);
+    g_buff_world_config.radius_m = std::max(0.0, buff_radius_mm * 0.001);
+    g_buff_world_config.hub_normal_offset_m =
+        buff_hub_normal_offset_mm * 0.001;
+    g_buff_world_tracker.configure(g_buff_world_config);
+
+    if (MoveMode == "big") {
+        buff_zju::BigBuffRansacConfig config;
+        private_nh.param<int>("buff_big_ransac_max_iterations",
+                             config.ransac.max_iterations, config.ransac.max_iterations);
+        private_nh.param<double>("buff_big_ransac_threshold",
+                                config.ransac.threshold, config.ransac.threshold);
+        private_nh.param<double>("buff_big_ransac_min_omega",
+                                config.ransac.min_omega, config.ransac.min_omega);
+        private_nh.param<double>("buff_big_ransac_max_omega",
+                                config.ransac.max_omega, config.ransac.max_omega);
+        private_nh.param<double>("buff_big_ransac_min_amplitude",
+                                config.ransac.min_amplitude, config.ransac.min_amplitude);
+        private_nh.param<double>("buff_big_ransac_max_amplitude",
+                                config.ransac.max_amplitude, config.ransac.max_amplitude);
+        int ransac_seed = static_cast<int>(config.ransac.random_seed);
+        private_nh.param<int>("buff_big_ransac_random_seed", ransac_seed,
+                              ransac_seed);
+        config.ransac.random_seed = ransac_seed < 0
+            ? config.ransac.random_seed
+            : static_cast<unsigned int>(ransac_seed);
+        private_nh.param<int>("buff_big_ransac_min_inliers",
+                             config.min_inliers, config.min_inliers);
+        private_nh.param<int>("buff_big_ransac_fit_every_n_samples",
+                             config.fit_every_n_samples, config.fit_every_n_samples);
+        private_nh.param<double>("buff_big_ransac_max_abs_speed",
+                                config.max_abs_speed, config.max_abs_speed);
+        private_nh.param<double>("buff_big_ransac_max_gap_seconds",
+                                config.max_gap_seconds, config.max_gap_seconds);
+        private_nh.param<int>("buff_big_ransac_max_consecutive_rejections",
+                             config.max_consecutive_rejections,
+                             config.max_consecutive_rejections);
+        const auto sanitized = buff_zju::sanitize_big_buff_ransac_config(config);
+        if (sanitized != config) ROS_WARN("[Fu] Invalid RANSAC parameters replaced by validated values");
+        g_big_buff_predictor.configure(sanitized, g_big_prediction_gate_config);
+        ROS_INFO("[Fu] Big sine model: iterations=%d fit_every=%d min_inliers=%d threshold=%.3f",
+                 sanitized.ransac.max_iterations, sanitized.fit_every_n_samples,
+                 sanitized.min_inliers, sanitized.ransac.threshold);
+    }
+    if (private_nh.hasParam("buff_big_ransac_enabled") ||
+        private_nh.hasParam("buff_big_variable_speed_enabled")) {
+        ROS_WARN("[Fu] Legacy predictor enable flags are ignored; buff_move_mode selects one model: small=pixel Kalman, big=RANSAC sine");
+    }
+    ROS_INFO("[Fu] Buff mode: %s, predictor: %s, display: %s",
+             MoveMode.c_str(), MoveMode == "big" ? "RANSAC sine" : "pixel Kalman",
+             g_buff_show_image ? "enabled" : "disabled");
+    ROS_INFO("[Fu] Buff model: %s", buff_model_path.c_str());
+    ROS_INFO("[Fu] Enemy color: %s, inference device: %s",
+             enemy_color.c_str(),
+             g_buff_recognizer_config.inference_device.c_str());
+    if (g_buff_recognizer_config.inference_device == "GPU") {
+        ROS_WARN("[Fu] 推理使用核显 GPU; 若 OpenVINO GPU 插件缺失会自动回退 CPU");
+    }
+    ROS_INFO("[Fu] World EKF: %s, control: %s, primary: %s, q IMU->map: %s, target: %.1f x %.1f mm",
+             g_buff_world_ekf_enabled ? "enabled" : "disabled",
+             g_buff_world_ekf_control_enabled ? "enabled" : "disabled",
+             g_buff_world_ekf_primary ? "enabled" : "disabled",
+             g_quaternion_is_imu_to_map ? "true" : "false",
+             g_buff_target_width_mm, g_buff_target_height_mm);
+    ROS_INFO("[Fu] Buff PnP K: fx=%.3f fy=%.3f cx=%.3f cy=%.3f",
+             g_buff_camera_matrix[0], g_buff_camera_matrix[4],
+             g_buff_camera_matrix[2], g_buff_camera_matrix[5]);
+    ROS_INFO("[Fu] 时间补偿: 视觉处理延迟=%.1f ms(%s), 电控指令延迟=%.1f ms, 合计=%.1f ms",
+             buffVisionProcessingDelaySeconds() * 1000.0,
+             vision_delay_auto ? "实测" : "固定",
+             buffCommandTimespanSeconds() * 1000.0,
+             buffTotalLeadCompensation() * 1000.0);
+
+    g_recognizer = new BuffRecognizer(
+        buff_model_path, enemy_color, g_buff_recognizer_config);
+    g_recognizer->setTargetPriority(
+        buff_target_priority,
+        buff_target_lock_timeout_seconds);
+
+    g_buff_pose_time_error_pub = nh.advertise<std_msgs::Float64>("/buff/image_pose_time_error_ms", 1);
+    g_buff_sync_bracket_pub = nh.advertise<geometry_msgs::Vector3Stamped>("/buff/sync_bracket", 1);
+    g_buff_debug_image_pub = nh.advertise<sensor_msgs::Image>("/buff/reprojection_image", 1);
+    ros::Subscriber SubCamera = nh.subscribe("/hikrobot_camera/rgb", 1, &doimage);
+    ros::NodeHandle display_nh;
+    display_nh.setCallbackQueue(&g_display_callback_queue);
+    ros::SubscribeOptions display_options = ros::SubscribeOptions::create<sensor_msgs::Image>(
+        "/hikrobot_camera/rgb", 4, &doDisplayImage, ros::VoidPtr(),
+        &g_display_callback_queue);
+    ros::Subscriber display_subscriber = display_nh.subscribe(display_options);
+    ros::AsyncSpinner display_spinner(1, &g_display_callback_queue);
+    display_spinner.start();
+    std::thread display_thread(buffDisplayLoop);
+    ros::Subscriber SubRmSerial = nh.subscribe("/RmSerialData", 200, &doserial);
+    PubAngle = nh.advertise<geometry_msgs::Vector3>("/auto_angle",1000);
+    debugpub = nh.advertise<std_msgs::Float64>("/debugpub", 1000);
+    debugpub1 = nh.advertise<std_msgs::Float64>("/debugpub1", 1000);
+    debugpub2 = nh.advertise<std_msgs::Float64>("/debugpub2", 1000);
+    debugpub3 = nh.advertise<std_msgs::Float64>("/debugpub3", 1000);
+    debugpub4 = nh.advertise<std_msgs::Float64>("/debugpub4", 1000);
+    world_ready_pub = nh.advertise<std_msgs::Bool>("/buff/world_ready", 1000);
+    current_pitch_pub = nh.advertise<std_msgs::Float64>("/buff/current_pitch", 1000);
+    current_yaw_pub = nh.advertise<std_msgs::Float64>("/buff/current_yaw", 1000);
+    expected_pitch_pub = nh.advertise<std_msgs::Float64>("/buff/expected_pitch", 1000);
+    expected_yaw_pub = nh.advertise<std_msgs::Float64>("/buff/expected_yaw", 1000);
+    predicted_pitch_pub = nh.advertise<std_msgs::Float64>("/buff/predicted_pitch", 1000);
+    predicted_yaw_pub = nh.advertise<std_msgs::Float64>("/buff/predicted_yaw", 1000);
+
+    try {
+        if (fu_config_path.empty()) {
+            g_coorConverter = new CoordinateTransformer();
+            ROS_WARN("[Fu] No Fu coordinate configuration supplied; using built-in defaults");
+        } else {
+            g_coorConverter = new CoordinateTransformer(fu_config_path);
+            ROS_INFO("[Fu] CoordinateTransformer loaded from: %s", fu_config_path.c_str());
+        }
+    } catch (const std::exception& error) {
+        ROS_FATAL("[Fu] Invalid coordinate configuration '%s': %s",
+                  fu_config_path.c_str(), error.what());
+        g_display_running.store(false);
+        g_raw_display_queue.stop();
+        g_processed_display_queue.stop();
+        display_spinner.stop();
+        if (display_thread.joinable()) display_thread.join();
+        return 1;
+    }
+
+    BuffTimingWindow timing_window(g_buff_slow_frame_ms);
+    auto last_timing_report = std::chrono::steady_clock::now();
+    auto previous_loop_start = std::chrono::steady_clock::now();
+    while (ros::ok() && g_display_running.load())
+    {
+        const auto loop_start = std::chrono::steady_clock::now();
+        const double loop_gap_ms = std::chrono::duration<double, std::milli>(
+            loop_start - previous_loop_start).count();
+        previous_loop_start = loop_start;
+        // A gap between loop iterations is time the process was descheduled or
+        // blocked outside every instrumented stage (thermal throttle, X11,
+        // USB/camera stall, ...). Log it so it is not confused with inference.
+        if (loop_gap_ms > 100.0) {
+            ROS_WARN("[BUFF_TIMING] main loop gap=%.1f ms (prev frame=%llu)",
+                     loop_gap_ms,
+                     static_cast<unsigned long long>(g_processed_frame_sequence));
+        }
+        g_buff_frame_timing = BuffFrameTiming{};
+        {
+            BuffStageTimer callbacks(g_buff_frame_timing, BuffTimingStage::Callbacks);
+            observeBuffClock();
+            ros::spinOnce();
+        }
+        const bool received_frame = g_received_frame_sequence != g_prepared_frame_sequence;
+        if (received_frame) {
+            g_prepared_frame_sequence = g_received_frame_sequence;
+            g_buff_prediction_ready = false;
+            g_recognizer->beginFrame();
+            g_buff_frame_timing.sequence = g_received_frame_sequence;
+        }
+        bool fresh_frame = false;
+        // Only a frame that actually went through prepareBuffSourceFrame() and
+        // the drawing block may reach the "Image with Point" display.  Pushing
+        // bare camera frames into that stream makes the HUD/prediction flash
+        // on and off at camera rate.
+        bool frame_processed = false;
+        if (g_buff_time_sync.pendingImageCount() != 0) {
+            BuffPoseMatch matched;
+            const auto status = g_buff_time_sync.poll(buffWallSeconds(), matched);
+            g_buff_sync_waiting = status == BuffTimeSynchronizer::Status::Waiting;
+            if (status == BuffTimeSynchronizer::Status::Ready ||
+                status == BuffTimeSynchronizer::Status::Expired) {
+                fresh_frame = true;
+                g_buff_frame_timing.sequence = matched.image_sequence;
+                g_buff_frame_timing.image_age_ms =
+                    (ros::Time::now().toSec() - matched.pose.stamp_seconds) * 1000.0;
+                bool task_ok = false;
+                if (status == BuffTimeSynchronizer::Status::Ready) {
+                    const auto source = std::find_if(g_pending_buff_images.begin(),
+                        g_pending_buff_images.end(), [&](const BufferedBuffImage& image) {
+                            return image.sequence == matched.image_sequence;
+                        });
+                    if (source == g_pending_buff_images.end()) {
+                        ROS_FATAL("[BUFF_SYNC] Matched image payload missing");
+                        return 1;
+                    }
+                    prepareBuffSourceFrame(*source);
+                    frame_processed = true;
+                    acceptBuffFramePose(matched);
+                    task_ok = Fu_Task();
+                } else {
+                    g_has_frame_imu_pose = false;
+                    g_buff_prediction_ready = false;
+                    g_recognizer->beginFrame();
+                    g_big_buff_predictor.reject();
+                    ROS_WARN_THROTTLE(1.0, "[BUFF_SYNC] Dropped frame=%llu: no valid IMU bracket within %.1fms",
+                        static_cast<unsigned long long>(matched.image_sequence),
+                        g_buff_time_sync_config.max_wait_seconds * 1000.0);
+                }
+                pruneBuffSourceImages();
+                g_buff_sync_waiting = status == BuffTimeSynchronizer::Status::Expired &&
+                    g_buff_time_sync.pendingImageCount() != 0;
+                observeBuffClock();
+                if (!task_ok && functional) {
+                    BuffStageTimer output(g_buff_frame_timing, BuffTimingStage::Output);
+                    // Retain the existing hold-command convention on a failed frame.
+                    Angle.x = -RmSerialData.Pitch;
+                    Angle.y = RmSerialData.Yaw;
+                    Angle.z = 1;
+                    std_msgs::Float64 debug_current_yaw;
+                    std_msgs::Float64 debug_expected_yaw;
+                    std_msgs::Float64 debug_expected_pitch;
+                    std_msgs::Float64 debug_current_pitch;
+                    std_msgs::Float64 debug_predicted_yaw;
+                    std_msgs::Float64 debug_predicted_pitch;
+                    debug_current_yaw.data = RmSerialData.Yaw;
+                    debug_current_pitch.data = RmSerialData.Pitch;
+                    debug_expected_yaw.data =
+                        std::numeric_limits<double>::quiet_NaN();
+                    debug_expected_pitch.data =
+                        std::numeric_limits<double>::quiet_NaN();
+                    debug_predicted_yaw.data =
+                        std::numeric_limits<double>::quiet_NaN();
+                    debug_predicted_pitch.data =
+                        std::numeric_limits<double>::quiet_NaN();
+                    current_pitch_pub.publish(debug_current_pitch);
+                    current_yaw_pub.publish(debug_current_yaw);
+                    predicted_pitch_pub.publish(debug_predicted_pitch);
+                    predicted_yaw_pub.publish(debug_predicted_yaw);
+                    debugpub.publish(debug_current_yaw);
+                    debugpub1.publish(debug_expected_yaw);
+                    expected_pitch_pub.publish(debug_expected_pitch);
+                    expected_yaw_pub.publish(debug_expected_yaw);
+                    PubAngle.publish(Angle);
+                    publishBuffInactiveCommand(status == BuffTimeSynchronizer::Status::Ready &&
+                        (g_recognizer->freshObservation() || g_recognizer->hasAssociatedObservation()));
+                }
+            }
+        }
+        // Stop stale output even if the camera stops after its last frame was
+        // consumed, leaving no pending image for the synchronizer to expire.
+        if (functional && g_buff_control_state.expired(
+                buffWallSeconds(), g_buff_control_timeout_seconds)) {
+            g_has_frame_imu_pose = g_buff_prediction_ready = false;
+            g_recognizer->beginFrame();
+            publishBuffInactiveCommand(false);
+            ROS_WARN_THROTTLE(1.0, "[Fu] No completed valid source frame within control deadline; aiming disabled");
+        }
+        const bool display_frame = received_frame || fresh_frame;
+
+        if (frame_processed && (g_buff_show_image || g_buff_publish_debug_image) &&
+            !frame.empty()) {
+            {
+                BuffStageTimer drawing(g_buff_frame_timing, BuffTimingStage::Draw);
+                g_recognizer->visual(frame);
+                cv::rectangle(frame, cv::Rect(0, std::max(0, frame.rows - 80), frame.cols,
+                    std::min(80, frame.rows)), cv::Scalar(0, 0, 0), -1);
+                const std::string mode_label = MoveMode == "big"
+                    ? "BUFF: BIG / RANSAC" : "BUFF: SMALL / KALMAN";
+                cv::putText(frame, mode_label, cv::Point(15, frame.rows - 55),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(0, 255, 255), 2);
+                cv::putText(frame, cv::format("%s  ID:%d  %s  frame:%llu",
+                    functional ? "ACTIVE" : "IDLE", g_recognizer->lockedBladeId(),
+                    g_buff_sync_waiting ? "SYNC WAIT" : g_buff_prediction_ready ? "AIM READY" :
+                        g_recognizer->freshObservation() ? "MODEL WAIT" : "NO OBS",
+                    static_cast<unsigned long long>(g_buff_sync_waiting
+                        ? g_received_frame_sequence : g_frame_sequence)),
+                    cv::Point(15, frame.rows - 25), cv::FONT_HERSHEY_SIMPLEX,
+                    0.6, cv::Scalar(0, 255, 255), 2);
+            }
+            if (g_buff_show_image) {
+                BuffStageTimer display(g_buff_frame_timing, BuffTimingStage::Display);
+                g_processed_display_queue.push(frame, g_frame_sequence);
+            }
+            if (fresh_frame && g_has_frame_imu_pose && g_buff_publish_debug_image &&
+                g_buff_debug_image_pub.getNumSubscribers() != 0) {
+                g_buff_debug_image_pub.publish(cv_bridge::CvImage(
+                    g_frame_header, sensor_msgs::image_encodings::BGR8, frame).toImageMsg());
+            }
+        }
+
+        const auto loop_end = std::chrono::steady_clock::now();
+        g_buff_frame_timing.total_ms =
+            std::chrono::duration<double, std::milli>(loop_end - loop_start).count();
+        // Also retain slow callback/UI iterations without a new image.
+        if (received_frame || fresh_frame || g_buff_frame_timing.total_ms >= g_buff_slow_frame_ms) {
+            timing_window.add(g_buff_frame_timing);
+        }
+        if (std::chrono::duration<double>(loop_end - last_timing_report).count() >= 1.0) {
+            const auto summary = timing_window.take();
+            const auto& worst = summary.worst;
+            if (summary.frames != 0) {
+                const auto log_start = std::chrono::steady_clock::now();
+                ROS_INFO(
+                    "[BUFF_TIMING] samples=%zu slow=%zu p99=%.1fms max=%.1fms frame=%llu "
+                    "arrival_gap_max=%.1fms capture_gap_max=%.1fms age=%.1fms "
+                    "worst(callbacks=%.1f copy=%.1f init=%.1f identify=%.1f observe=%.1f "
+                    "predict=%.1f solve=%.1f output=%.1f draw=%.1f display=%.1f log=%.1f)ms",
+                    summary.frames, summary.slow_frames, summary.p99_ms, worst.total_ms,
+                    static_cast<unsigned long long>(worst.sequence),
+                    summary.max_arrival_gap_ms, summary.max_capture_gap_ms, worst.image_age_ms,
+                    worst.stage(BuffTimingStage::Callbacks), worst.stage(BuffTimingStage::Copy),
+                    worst.stage(BuffTimingStage::Initialize), worst.stage(BuffTimingStage::Identify),
+                    worst.stage(BuffTimingStage::Observe), worst.stage(BuffTimingStage::Predict),
+                    worst.stage(BuffTimingStage::Solve), worst.stage(BuffTimingStage::Output),
+                    worst.stage(BuffTimingStage::Draw), worst.stage(BuffTimingStage::Display),
+                    worst.stage(BuffTimingStage::Diagnostics));
+                const double log_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - log_start).count();
+                if (log_ms >= g_buff_slow_frame_ms) {
+                    BuffFrameTiming log_event;
+                    log_event.total_ms = log_ms;
+                    log_event.ms[static_cast<std::size_t>(BuffTimingStage::Diagnostics)] = log_ms;
+                    timing_window.add(log_event); // Report a blocked diagnostic write next time.
+                }
+            }
+            last_timing_report = loop_end;
+        }
+        if (!display_frame && (!g_buff_show_image || frame.empty())) {
+            ros::WallDuration(0.001).sleep();
+        }
+    }
+
+    g_display_running.store(false);
+    g_raw_display_queue.stop();
+    g_processed_display_queue.stop();
+    display_spinner.stop();
+    if (display_thread.joinable()) display_thread.join();
+    return 0;
+}

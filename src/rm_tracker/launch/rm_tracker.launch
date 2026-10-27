@@ -1,0 +1,21 @@
+<launch>
+    <!-- 相机由 start.launch 统一启动, 此处不再重复 -->
+
+    <!-- 启动识别节点 -->
+   <node name="detector" pkg="rm_identify" type="identify" output="screen">
+        <param name="detect_mode" value="energy_fan" />  <!-- 能量机关模式 -->
+    </node>
+
+    <!-- 启动跟踪节点 -->
+    <node name="tracker" pkg="rm_tracker" type="tracker" output="screen">
+        <param name="armor_tracker_config" value="$(find rm_tracker)/config/config.yaml" />
+    </node>
+
+    <!-- 启动串口节点（已注释，避免与 start.launch 重复） -->
+    <!--
+    <node name="serial" pkg="rm_serial" type="rm_serial_node" output="screen">
+        <param name="port" value="/dev/ttyUSB0" />
+        <param name="baud_rate" value="115200" />
+    </node>
+    -->
+</launch>

@@ -1,0 +1,156 @@
+<html style="margin:0;padding:0;">
+<title>重投影误差测 EKF 收敛：原理与测试方法</title>
+<div style="width:100%;box-sizing:border-box;font-family:'Microsoft YaHei','PingFang SC',system-ui,sans-serif;color:#1f2937;padding:16px;max-width:960px;margin:0 auto;">
+  <h2 style="margin:0 0 6px;font-size:22px;">重投影误差测 EKF 收敛：原理与测试方法</h2>
+  <p style="margin:0 0 14px;font-size:14px;color:#374151;">一句话：重投影误差 = 三维状态误差在图像上的可观测投影。没有真值测不到状态误差，但每帧都能测到「预测投影点 vs 实际检测点」的像素差；误差落到噪声底 = 已收敛，误差大/振荡 = 未收敛或模型错。</p>
+
+  <h3 style="font-size:17px;margin:18px 0 8px;">① 原理：状态 → 投影 → 与检测对比</h3>
+  <div style="width:100%;overflow-x:auto;">
+  <svg viewBox="0 0 900 350" style="width:100%;max-width:900px;height:auto;display:block;">
+    <defs>
+      <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 Z" fill="#5b6472"/></marker>
+      <marker id="arRed" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L8,4.5 L0,9 Z" fill="#d93025"/></marker>
+    </defs>
+
+    <!-- 估计链标签 -->
+    <text x="40" y="12" font-size="13" fill="#5b6472">估计链（可算、不可直接测真值）</text>
+    <!-- A1 状态 -->
+    <rect x="40" y="15" width="220" height="80" rx="8" fill="#e8f0fe" stroke="#1a73e8" stroke-width="1.5"/>
+    <text x="50" y="34" font-size="14" font-weight="bold" fill="#174ea6">① EKF 状态（世界系）</text>
+    <text x="50" y="52" font-size="13" fill="#1f2937">中心 (x,y,z)</text>
+    <text x="50" y="67" font-size="13" fill="#1f2937">yaw / pitch / 角速度 ω</text>
+    <text x="50" y="85" font-size="13" fill="#d93025">无真值 · 误差不可直接测</text>
+    <!-- 箭头 -->
+    <line x1="150" y1="95" x2="150" y2="113" stroke="#5b6472" stroke-width="1.5" marker-end="url(#ar)"/>
+    <!-- A2 模型 -->
+    <rect x="40" y="115" width="220" height="80" rx="8" fill="#e8f0fe" stroke="#1a73e8" stroke-width="1.5"/>
+    <text x="50" y="134" font-size="14" font-weight="bold" fill="#174ea6">② 叶片 3D 模型</text>
+    <text x="50" y="152" font-size="13" fill="#1f2937">第 i 叶片角：θᵢ = θ + i·72°</text>
+    <text x="50" y="167" font-size="13" fill="#1f2937">装甲点 = 中心 + 半径 r</text>
+    <text x="50" y="185" font-size="13" fill="#1f2937">→ 预测三维点 P_w</text>
+    <!-- 箭头 -->
+    <line x1="150" y1="195" x2="150" y2="213" stroke="#5b6472" stroke-width="1.5" marker-end="url(#ar)"/>
+    <!-- A3 投影 -->
+    <rect x="40" y="215" width="220" height="80" rx="8" fill="#e8f0fe" stroke="#1a73e8" stroke-width="1.5"/>
+    <text x="50" y="234" font-size="14" font-weight="bold" fill="#174ea6">③ 投影到图像</text>
+    <text x="50" y="252" font-size="13" fill="#1f2937">p̂ = K·[R|t]·P_w</text>
+    <text x="50" y="267" font-size="13" fill="#1f2937">内参 K + 相机外参 R,t</text>
+    <text x="50" y="285" font-size="13" fill="#1f2937">→ 预测像素点 p̂(û,v̂)</text>
+
+    <!-- 观测链标签 -->
+    <text x="650" y="12" font-size="13" fill="#5b6472">观测链（每帧可测）</text>
+    <!-- B1 检测 -->
+    <rect x="650" y="15" width="210" height="80" rx="8" fill="#e6f4ea" stroke="#188038" stroke-width="1.5"/>
+    <text x="660" y="34" font-size="14" font-weight="bold" fill="#137333">④ 相机检测</text>
+    <text x="660" y="52" font-size="13" fill="#1f2937">装甲四角 / 中心像素点</text>
+    <text x="660" y="67" font-size="13" fill="#1f2937">p(u,v) · 每帧都有</text>
+    <text x="660" y="85" font-size="13" fill="#137333">可观测的「真值代理」</text>
+
+    <!-- C1 误差 -->
+    <rect x="330" y="130" width="240" height="80" rx="8" fill="#fef7e0" stroke="#f9ab00" stroke-width="1.5"/>
+    <text x="340" y="154" font-size="14" font-weight="bold" fill="#b06000">⑤ 重投影误差</text>
+    <text x="340" y="174" font-size="14" fill="#1f2937">e = ‖p̂ − p‖（像素）</text>
+    <text x="340" y="196" font-size="13" fill="#b06000">大 → 未收敛 · 小 → 已收敛</text>
+
+    <!-- D1 判定 -->
+    <rect x="330" y="245" width="240" height="80" rx="8" fill="#fce8e6" stroke="#d93025" stroke-width="1.5"/>
+    <text x="340" y="268" font-size="14" font-weight="bold" fill="#a50e0e">⑥ 判收敛</text>
+    <text x="340" y="287" font-size="13" fill="#1f2937">e ≈ 噪底(1~3px) → 已收敛</text>
+    <text x="340" y="304" font-size="13" fill="#1f2937">e &gt; 10px / 振荡 → 未收敛/模型错</text>
+
+    <!-- A3 -> C1 -->
+    <line x1="262" y1="255" x2="324" y2="178" stroke="#5b6472" stroke-width="1.5" marker-end="url(#ar)"/>
+    <!-- B1 -> C1 -->
+    <line x1="648" y1="58" x2="578" y2="168" stroke="#5b6472" stroke-width="1.5" marker-end="url(#ar)"/>
+    <!-- C1 -> D1 -->
+    <line x1="450" y1="210" x2="450" y2="243" stroke="#5b6472" stroke-width="1.5" marker-end="url(#ar)"/>
+    <!-- 反馈回路 -->
+    <line x1="330" y1="282" x2="312" y2="282" stroke="#d93025" stroke-width="1.5" stroke-dasharray="5,4"/>
+    <line x1="312" y1="282" x2="312" y2="55" stroke="#d93025" stroke-width="1.5" stroke-dasharray="5,4"/>
+    <line x1="312" y1="55" x2="264" y2="55" stroke="#d93025" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arRed)"/>
+    <text x="288" y="48" font-size="13" fill="#d93025" text-anchor="middle">新息反馈</text>
+  </svg>
+  </div>
+
+  <h3 style="font-size:17px;margin:18px 0 8px;">② 收敛曲线示意：误差随时间的典型形态</h3>
+  <p style="margin:0 0 8px;font-size:13px;color:#6b7280;">示意：曲线为说明性数据，非实测记录。</p>
+  <div style="width:100%;overflow-x:auto;">
+  <svg viewBox="0 0 900 340" style="width:100%;max-width:900px;height:auto;display:block;">
+    <!-- 噪声底带 -->
+    <rect x="70" y="274" width="790" height="7.3" fill="#e6f4ea" stroke="none"/>
+    <text x="74" y="270" font-size="13" fill="#137333">噪声底 1~3px</text>
+    <!-- 判敛线 -->
+    <line x1="70" y1="256.7" x2="860" y2="256.7" stroke="#d93025" stroke-width="1.2" stroke-dasharray="6,4"/>
+    <text x="74" y="250" font-size="13" fill="#d93025">判敛线 5px</text>
+    <!-- 误差曲线 -->
+    <polyline points="70,92 149,196 228,248 307,265.3 386,274 465,278.3 544,275.7 583.5,144 623,222 662.5,265.3 702,274 781,278.3 860,275.7" fill="none" stroke="#1a73e8" stroke-width="2.5" stroke-linejoin="round"/>
+    <!-- 坐标轴 -->
+    <line x1="70" y1="300" x2="860" y2="300" stroke="#9ca3af" stroke-width="1.5"/>
+    <line x1="70" y1="40" x2="70" y2="300" stroke="#9ca3af" stroke-width="1.5"/>
+    <text x="58" y="24" font-size="14" fill="#1f2937">重投影误差 (px)</text>
+    <!-- Y 刻度 -->
+    <text x="58" y="44" font-size="13" fill="#6b7280" text-anchor="end">30</text>
+    <text x="58" y="131" font-size="13" fill="#6b7280" text-anchor="end">20</text>
+    <text x="58" y="218" font-size="13" fill="#6b7280" text-anchor="end">10</text>
+    <text x="58" y="304" font-size="13" fill="#6b7280" text-anchor="end">0</text>
+    <!-- X 刻度 -->
+    <text x="70" y="316" font-size="13" fill="#6b7280" text-anchor="middle">0</text>
+    <text x="228" y="316" font-size="13" fill="#6b7280" text-anchor="middle">20</text>
+    <text x="386" y="316" font-size="13" fill="#6b7280" text-anchor="middle">40</text>
+    <text x="544" y="316" font-size="13" fill="#6b7280" text-anchor="middle">60</text>
+    <text x="702" y="316" font-size="13" fill="#6b7280" text-anchor="middle">80</text>
+    <text x="860" y="316" font-size="13" fill="#6b7280" text-anchor="middle">100</text>
+    <text x="465" y="334" font-size="14" fill="#1f2937" text-anchor="middle">时间 →（帧）</text>
+    <!-- 阶段标注 -->
+    <text x="70" y="70" font-size="13" font-weight="bold" fill="#a50e0e">初始化（误差大）</text>
+    <text x="228" y="238" font-size="13" fill="#1f2937">收敛过程</text>
+    <text x="430" y="240" font-size="13" fill="#137333">稳态 ≈ 噪声底</text>
+    <text x="583.5" y="118" font-size="13" font-weight="bold" fill="#a50e0e" text-anchor="middle">遮挡 → 误差尖峰</text>
+    <text x="700" y="290" font-size="13" fill="#137333">重新收敛</text>
+  </svg>
+  </div>
+
+  <h3 style="font-size:17px;margin:18px 0 8px;">③ 怎么测：每帧闭环 + 聚合指标</h3>
+  <div style="display:flex;flex-wrap:wrap;gap:10px;">
+    <div style="flex:1 1 280px;min-width:260px;border:1px solid #d1d5db;border-radius:8px;padding:10px 12px;background:#f9fafb;">
+      <b style="font-size:14px;">每帧流程（离线 rosbag 回放 / 在线）</b>
+      <ol style="margin:6px 0 0;padding-left:20px;font-size:14px;line-height:1.7;">
+        <li>取检测：装甲四角/中心像素点（带时间戳）</li>
+        <li>取状态：EKF 输出的世界系 buff 中心、yaw/pitch、ω</li>
+        <li>模型预测：θᵢ = θ + i·72°，装甲点 = 中心 + 半径 r → 三维点 P_w</li>
+        <li>投影：û = K·[R|t]·P_w（内参 + 外参/里程计）</li>
+        <li>算误差：每点 e = ‖p̂ − p‖，每帧取平均与最大</li>
+        <li>聚合指标并画曲线</li>
+      </ol>
+    </div>
+    <div style="flex:1 1 280px;min-width:260px;border:1px solid #d1d5db;border-radius:8px;padding:10px 12px;background:#f9fafb;">
+      <b style="font-size:14px;">四个指标</b>
+      <ul style="margin:6px 0 0;padding-left:20px;font-size:14px;line-height:1.7;">
+        <li><b>收敛时间</b>：从首帧到误差持续 &lt; 判敛线（连续 N 帧）的帧数</li>
+        <li><b>稳态 RMS</b>：收敛后误差均方根，与检测噪声 σ 对比</li>
+        <li><b>NIS 一致性</b>：标准化新息按 χ²(2) 检验，均值应 ≈ 2</li>
+        <li><b>残差自相关</b>：收敛后应为白噪声；若随旋转频率振荡 → 模型错</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3 style="font-size:17px;margin:18px 0 8px;">④ 测试场景与判据</h3>
+  <table style="width:100%;border-collapse:collapse;font-size:14px;">
+    <tr style="background:#f3f4f6;">
+      <th style="border:1px solid #d1d5db;padding:6px 8px;text-align:left;">场景</th>
+      <th style="border:1px solid #d1d5db;padding:6px 8px;text-align:left;">做法</th>
+      <th style="border:1px solid #d1d5db;padding:6px 8px;text-align:left;">看什么 / 怎么用</th>
+    </tr>
+    <tr><td style="border:1px solid #d1d5db;padding:6px 8px;">静态测噪底</td><td style="border:1px solid #d1d5db;padding:6px 8px;">机关不动</td><td style="border:1px solid #d1d5db;padding:6px 8px;">误差应落 1~3px → 得 σ，定判敛阈值</td></tr>
+    <tr><td style="border:1px solid #d1d5db;padding:6px 8px;">初始化偏差</td><td style="border:1px solid #d1d5db;padding:6px 8px;">给错初值 / 中途重初始化</td><td style="border:1px solid #d1d5db;padding:6px 8px;">收敛帧数、有无过冲振荡 → 判初值鲁棒性</td></tr>
+    <tr><td style="border:1px solid #d1d5db;padding:6px 8px;">遮挡恢复</td><td style="border:1px solid #d1d5db;padding:6px 8px;">遮挡 0.5~2s 再露出</td><td style="border:1px solid #d1d5db;padding:6px 8px;">尖峰后重新收敛帧数 → 判预测外推能力</td></tr>
+    <tr><td style="border:1px solid #d1d5db;padding:6px 8px;">变速</td><td style="border:1px solid #d1d5db;padding:6px 8px;">慢 / 中 / 快转速</td><td style="border:1px solid #d1d5db;padding:6px 8px;">高速下误差抬升 = 预测滞后 → 调过程噪声 Q / ω 模型</td></tr>
+    <tr><td style="border:1px solid #d1d5db;padding:6px 8px;">真值对照（可选）</td><td style="border:1px solid #d1d5db;padding:6px 8px;">编码器 / 已知角度</td><td style="border:1px solid #d1d5db;padding:6px 8px;">状态误差 vs 重投影误差是否同步 → 验证代理有效性</td></tr>
+  </table>
+
+  <div style="margin-top:14px;border:1px solid #f9ab00;border-radius:8px;background:#fef7e0;padding:10px 12px;font-size:14px;line-height:1.7;">
+    <b>调参判据（对应你正在调 R / Q）</b>：稳态 RMS ≤ 2~3×σ（通常 &lt;5px）→ 收敛良好；NIS 均值 ≫ 2 → Q 太小（过度自信）或 R 偏小；NIS 均值 ≪ 2 → Q 太大（迟钝）。<br/>
+    <b>注意误差耦合</b>：若相机位姿 R,t 来自同一装甲的 PnP，重投影误差会混入 PnP 误差，不是纯滤波收敛；改用里程计/陀螺位姿，或把两条来源分开记录对比。
+  </div>
+</div>
+</html>

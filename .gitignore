@@ -1,0 +1,15 @@
+build/
+devel/
+install/
+log/
+*.log
+*.bag
+.vscode/
+.idea/
+.marscode/
+*.swp
+*~
+tmp/
+.cache/
+__pycache__/
+*.pyc

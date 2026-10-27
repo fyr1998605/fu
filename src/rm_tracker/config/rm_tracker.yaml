@@ -1,0 +1,349 @@
+---
+Tracker:
+  # 电控延迟 0.2 0.015
+  COMMAND_TIMESPAN: 0.2
+  # 重力加速度
+  local_gravity_: 9.80665
+  # 曝光时间 0.002
+  eTime: 0.02
+  # 图像传输,程序运行处理等时间
+  delay_time: -0.02
+  # 目标丢失判定时间
+  trackTime: 0.7
+  # pitch补偿 减小往下 增大往上 麦轮: -0.075 英雄: 0.12 全向: 0.0225
+  pitch_compensation: -0.028
+  # yaw补偿   增大往左 减小往右 麦轮: 0.010 英雄: -0.06 全向: 0
+  yaw_compensation: -0.005
+  # 装甲板匹配得分最大值
+  score_tolerance: 1.0
+  # 更新装甲板切换的角度阈值,角度制
+  switch_threshold: 15
+  # 自动击发时目标装甲板相对偏角最大值,角度值 
+  aim_angle_tolerance: 40
+  # 自动击发位姿偏差最大值,弧度制 英雄: 0.025 步兵 0.05
+  aim_pose_tolerance: 0.05
+  # 跟随圆心自动击发目标偏角判断
+  aim_center_angle_tolerance: 1
+  # 更换锁中心模式角速度阈值，弧度制
+  switch_trackmode_threshold: 1.2
+  # 跟随圆心转跟随装甲板的目标旋转速度最大值，弧度制
+  aim_center_palstance_threshold: 6.5
+  # 强制允许发射的目标旋转速度最大值，弧度制 0.8
+  force_aim_palstance_threshold: 8
+  # 是否跟随装甲板中心
+  track_center: 1
+  # 重力补偿开关
+  fix_on: 1
+  # 空气阻力系数 1.5
+  k: 0.47
+  # 弹速
+  BulletVector: 23.5 # 步兵哨兵: 21 英雄: 12
+
+  # 全向
+  # pitch补偿 减小往下 增大往上
+  # yaw补偿   增大往左 减小往右
+  # ~4m硬补偿
+  pitch_compensation4meter: 0
+  yaw_compensation4meter: 0
+  # 5.5m硬补偿
+  pitch_compensation5_5meter: 0
+  yaw_compensation5_5meter: 0
+  # 6m硬补偿
+  pitch_compensation6meter: 0
+  yaw_compensation6meter: 0
+  # 6.5m硬补偿
+  pitch_compensation6_5meter: 0
+  yaw_compensation6_5meter: 0
+
+  # # 麦轮
+  # # pitch补偿 减小往下 增大往上
+  # # yaw补偿   增大往左 减小往右
+  # # ~4m硬补偿
+  # pitch_compensation4meter: 0
+  # yaw_compensation4meter: 0
+  # # 5.5m硬补偿
+  # pitch_compensation5_5meter: 0
+  # yaw_compensation5_5meter: 0
+  # # 6m硬补偿
+  # pitch_compensation6meter: 0
+  # yaw_compensation6meter: 0
+  # # 6.5m硬补偿
+  # pitch_compensation6_5meter: 0
+  # yaw_compensation6_5meter: 0
+
+  # # 英雄
+  # # pitch补偿 减小往下 增大往上
+  # # yaw补偿   增大往左 减小往右
+  # # ~4m硬补偿
+  # pitch_compensation4meter: 0
+  # yaw_compensation4meter: 0
+  # # 5.5m硬补偿
+  # pitch_compensation5_5meter: 0
+  # yaw_compensation5_5meter: 0
+  # # 6m硬补偿
+  # pitch_compensation6meter: 0
+  # yaw_compensation6meter: 0
+  # # 6.5m硬补偿
+  # pitch_compensation6_5meter: 0
+  # yaw_compensation6_5meter: 0
+
+  # # 哨兵
+  # # pitch补偿 减小往下 增大往上
+  # # yaw补偿   增大往左 减小往右
+  # # ~4m硬补偿
+  # pitch_compensation4meter: 0
+  # yaw_compensation4meter: 0
+  # # 5.5m硬补偿
+  # pitch_compensation5_5meter: 0
+  # yaw_compensation5_5meter: 0
+  # # 6m硬补偿
+  # pitch_compensation6meter: 0
+  # yaw_compensation6meter: 0
+  # # 6.5m硬补偿
+  # pitch_compensation6_5meter: 0
+  # yaw_compensation6_5meter: 0
+
+ModelObserver:
+  # 初始值,但代码中应该动态计算实际帧时间
+  # 参数调整原则
+  # 过程噪声调大: 滤波器更信任测量值,响应块但可能更震荡
+  # 过程噪声调小：滤波器更信任预测值,相应更平滑但可能滞后
+  # 观测噪声调大: 滤波器更信任预测值,对测量误差不敏感
+  # 观测噪声调小: 滤波器更信任测量值,对状态变化更敏感
+  # 响应迟缓增大Q减小R,过度震荡减小Q增大R
+  dt: 0.025
+  
+  Standard:
+    # 初始化半径
+    init_radius: 0.2
+    # 测距噪声关于角度的增益函数
+    gain: 25
+
+    # 过程噪声(表示模型的不确定性)Q
+    process_noise:
+      # 位移的高阶差分噪声.控制位置和速度变化的不确定性,值越大滤波器对新测量的相应越慢
+      displace_high_diff: 0.15
+      # 角度的高阶差分噪声.控制角度和角速度变化的不确定性
+      anglar_high_diff: 16
+      # 高度噪声.机器人高度变化的不确定性
+      height: 0.0001
+      # 旋转半径噪声.机器人旋转半径变化的不确定性
+      radius: 0.0005
+
+    # 观测噪声系数 R
+    measure_noise:
+      # 位置观测噪声,视觉测量位置的不确定性(和x,y有关)
+      pose: 0.00164
+      # 距离观测噪声,测距的不确定性(和z有关)
+      distance: 0.0129
+      # 角度观测网噪声,角度怎两的不确定性
+      angle: 0.1
+
+  Balance:
+    # 初始半径
+    init_radius: 0.2
+    # 测距噪声关于角度的增益的函数
+    gain: 30
+
+    # 状态转移噪声系数
+    process_noise: 
+      # 更小的位移噪声,因为平衡步兵运动模型更可预测
+      displace_high_diff: 0.2
+      # 较大的角度噪声,因为平衡步兵旋转更频繁
+      anglar_high_diff: 10
+      # 更小的高度噪声,高度变化较小
+      height: 0.0001
+      # 更小的半径噪声,旋转半径更稳定
+      radius: 0.00001
+
+    # 观测噪声系数
+    measure_noise: 
+      # 更小的位置噪声,假设视觉检测更准确
+      pose: 0.002
+      # 更小的距离噪声,测距更准确
+      distance: 0.01
+      # 较大的角度噪声,因为平衡步兵角度变化大
+      angle: 0.5
+
+  Outpost:
+    # 很高的增益,因为前哨战固定,距离测量噪声角度变化影响大
+    # 初始半径
+    init_radius: 0.256
+    gain: 100
+
+    # 状态转移噪声系数
+    process_noise:
+      # 极小的位移噪声,因为前哨战基本不动
+      displace_high_diff: 0.01
+      # 较小的角度噪声,前哨战有小幅度固定的旋转
+      anglar_high_diff: 2.0
+      # 极小的高度噪声,高度固定不变
+      height: 0.0035
+      radius: 0.0005
+
+    # 观测噪声系数
+    measure_noise:
+      # 很小的位置噪声,固定目标检测准确
+      pose: 0.0005
+      # 中等距离噪声
+      distance: 0.01
+      # 较小的角度噪声,角度测量相对准确
+      angle: 0.02
+
+CoordinateTransformer: 
+  'off':
+    # 全向和麦轮(步兵)
+    # 世界系 -> 陀螺仪 平移偏移量
+    imu2Map_trans_off_x: 0
+    imu2Map_trans_off_y: 0
+    imu2Map_trans_off_z: 0.055
+    # 陀螺仪 -> 相机 旋转偏移量
+    cam2Imu_rpy_off_roll: -1.57079632679489661923
+    cam2Imu_rpy_off_pitch: 0
+    cam2Imu_rpy_off_yaw: -1.57079632679489661923
+    # 陀螺仪 -> 相机 平移偏移量
+    cam2Imu_trans_off_x: 0.135
+    cam2Imu_trans_off_y: 0
+    cam2Imu_trans_off_z: -0.012
+    # 陀螺仪 -> 枪管 旋转偏移量
+    gun2Imu_rpy_off_roll: 0
+    gun2Imu_rpy_off_pitch: 0
+    gun2Imu_rpy_off_yaw: 0
+    # 陀螺仪 -> 枪管 平移偏移量 0.14524 0 -0.055
+    gun2Imu_trans_off_x: 0.14524
+    gun2Imu_trans_off_y: 0
+    gun2Imu_trans_off_z: -0.055
+
+    # # 英雄
+    # # 陀螺仪 -> 世界 平移偏移量
+    # imu2Map_trans_off_x: 0
+    # imu2Map_trans_off_y: 0
+    # imu2Map_trans_off_z: 0.101
+    # # 相机 -> 陀螺仪 旋转偏移量
+    # cam2Imu_rpy_off_roll: -1.7097
+    # cam2Imu_rpy_off_pitch: 0
+    # cam2Imu_rpy_off_yaw: -1.57079632679489661923
+    # # 相机 -> 陀螺仪 平移偏移量
+    # cam2Imu_trans_off_x: 0.00377
+    # cam2Imu_trans_off_y: 0.0739606
+    # cam2Imu_trans_off_z: 0.01777782
+    # # 枪管 -> 陀螺仪 旋转偏移量
+    # gun2Imu_rpy_off_roll: 0
+    # gun2Imu_rpy_off_pitch: 0
+    # gun2Imu_rpy_off_yaw: 0
+    # # 枪管 -> 陀螺仪 平移偏移量
+    # gun2Imu_trans_off_x: 0.10687719
+    # gun2Imu_trans_off_y: 0
+    # gun2Imu_trans_off_z: -0.100695
+
+    # # 哨兵
+    # # 世界系 -> 陀螺仪 平移偏移量
+    # imu2Map_trans_off_x: 0
+    # imu2Map_trans_off_y: 0
+    # imu2Map_trans_off_z: 0.07084
+    # # 陀螺仪 -> 相机 旋转偏移量
+    # cam2Imu_rpy_off_roll: -1.57079632679489661923
+    # cam2Imu_rpy_off_pitch: 0
+    # cam2Imu_rpy_off_yaw: -1.57079632679489661923
+    # # 陀螺仪 -> 相机 平移偏移量0.08169
+    # cam2Imu_trans_off_x: 0.08169
+    # cam2Imu_trans_off_y: 0
+    # cam2Imu_trans_off_z: -0.03612
+    # # 陀螺仪 -> 枪管 旋转偏移量
+    # gun2Imu_rpy_off_roll: 0
+    # gun2Imu_rpy_off_pitch: 0
+    # gun2Imu_rpy_off_yaw: 0
+    # # 陀螺仪 -> 枪管 平移偏移量
+    # gun2Imu_trans_off_x: 0.14524
+    # gun2Imu_trans_off_y: 0
+    # gun2Imu_trans_off_z: -0.07084
+
+# 西工大MPC
+MPC:
+  debug: 0
+  # 预测步长
+  # step太小: 优点: 计算快,响应迅速 缺点: 目光短浅,长时优化差
+  # step适中: 平衡性能与计算,需要合理调参
+  # step太大: 优点: 前瞻性好,稳定   缺点: 计算量大,易发散
+  step: 5
+
+  # 过程误差权重
+  # Q对预测时间段内误差的重视程度
+  # Q较大 -> 非常在意角度误差,会快速调整
+  # Q较小 -> 可以容忍一定的角度误差
+  process_error_weight:
+    Q0: 800 # ptich
+    Q1: 80 # yaw
+    Q2: 1     # vptich
+    Q3: 1     # vyaw
+
+  # 控制权重矩阵
+  # R代表对预测时间段控制量的重视程度
+  # R较大 -> MPC会尽量使用小的控制量,更平滑但响应慢
+  # R较小 -> 允许使用更大的控制量,响应快但可能震荡
+  process_control_weight:
+    R0: 10 # pitch
+    R1: 8  # yaw
+  
+  # 终端误差权重
+  # F代表对预测时间段后的这一时刻的误差量的重视程度
+  target_error_weight:
+    F0: 800 # pitch
+    F1: 100 # yaw
+    F2: 1
+    F3: 1
+  # F太大
+    # 行为: MPC急功近利
+    # 表现: 一开始猛打方向盘,试图快速到达终端状态
+    # 问题: 过程中剧烈震荡
+  # F太小:
+    # 行为: MPC变得目光短浅
+    # 表现: 只关心眼前误差,不计划长远
+    # 问题: 终端时可误差大,打不中移动目标
+  # F合适:
+    # 行为: MPC眼光长远
+    # 表现: 平衡过程跟踪和终端精度
+    # 结果: 平衡跟踪,最终准确命中
+
+# 同济MPC
+Planner:
+  fire_thresh: 0.0035
+
+  max_yaw_acc: 50
+  Q_yaw: [9e6, 0]
+  R_yaw: [1]
+
+  max_pitch_acc: 100
+  Q_pitch: [9e6, 0]
+  R_pitch: [1]
+  mpc_delay_time: 0.2
+
+
+
+Camera:
+  # # 全向相机参数
+  # camera_matrix: [1347.93326086626, -0.672132825485150, 626.700814128895, 0, 1348.26557115282, 468.782030270396, 0, 0, 1]
+  # dist_coeffs: [0.00818778651579363, -0.427976177253461, -0.00786867262069966,-0.000139239907792465, 1.44351306045196]
+
+  # # 麦伦相机参数
+  camera_matrix: [1692.72620365811, 0.363957161762693,643.964129877484, 0 ,1692.43288845269 ,502.492890249832, 0 ,0 , 1]
+  dist_coeffs: [-0.111874561711212, -0.000296513404483851, 0.884391394501360, -0.00202166770416446,-1.84111324474713]
+
+  # # 英雄相机参数
+  # camera_matrix: [1719.19901340578, 0.769785626725599, 636.666469487618, 0, 1718.96072245810, 504.757799233704, 0, 0, 1]
+  # dist_coeffs: [-0.0700606127417525, 0.222168321400016, -0.00320134836743775,0.00157636066107524, 0.768502814713371]
+
+  # # 哨兵相机参数
+  # camera_matrix: [1719.19901340578, 0.769785626725599, 636.666469487618, 0, 1718.96072245810, 504.757799233704, 0, 0, 1]
+  # dist_coeffs: [-0.0700606127417525, 0.222168321400016, -0.00320134836743775,0.00157636066107524, 0.768502814713371]
+
+InstallOffset:
+  # 相机造成的误差
+  # 校准后通过误差测定函数测定填入 麦轮参数: 
+  # 这里设定的参数需要和串口那里相同*****
+  # 警告 警告 警告 警告 这里设定的yaml文件需和自瞄相同
+  rollOffset: 0
+  # pitchOffset: 0
+  pitchOffset: 0
+
+  yawOffset: 0

@@ -1,0 +1,4 @@
+<launch>
+    <!-- pkg:节点所在包名 type: 可执行文件的名称 name: respawn:是否自动重启该节点 节点的名称 output: 输出到控制台 -->
+    <node pkg="rm_identify" type="handeye" name="handeye_node" respawn="true" output="screen" /> 
+</launch>

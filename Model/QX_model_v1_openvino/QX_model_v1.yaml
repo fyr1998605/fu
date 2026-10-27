@@ -1,0 +1,8 @@
+train: QX_model_v1/train/images  # train images (relative to 'path') 128 images
+val: QX_model_v1/val/images # val images (relative to 'path') 128 images
+test:  QX_model_v1/test/images# test images (optional)
+
+# Classes
+names:
+ 0 : red
+ 1 : blue

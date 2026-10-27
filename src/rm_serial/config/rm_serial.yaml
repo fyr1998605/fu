@@ -1,0 +1,13 @@
+---
+Time:
+  # Host receipt-to-sampling estimate. The 36-byte packet has no MCU clock.
+  receive_delay_sec: 0.0
+InstallOffset:
+  # 相机和C板和电控姿态解算共同造成的误差
+  # 校准后通过误差测定函数测定填入 麦轮参数: 
+  # 这里设定的参数需要和自瞄相同*****
+  # 警告 警告 警告 警告 这里设定的yaml文件需和自瞄相同
+  rollOffset: 0
+  # pitchOffset: 0
+  pitchOffset: 0
+  yawOffset: 0

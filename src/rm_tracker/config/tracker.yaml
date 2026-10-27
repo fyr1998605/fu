@@ -1,0 +1,27 @@
+# 跟踪参数
+track_time: 0.5
+bullet_speed: 21.0
+gravity: 9.8
+
+# 阈值参数
+score_tolerance: 10.0
+switch_threshold: 30.0
+force_aim_palstance_threshold: 1.0
+aim_angle_tolerance: 15.0
+aim_pose_tolerance: 0.1
+aim_center_angle_tolerance: 10.0
+switch_trackmode_threshold: 0.5
+aim_center_palstance_threshold: 0.3
+
+# 补偿参数
+pitch_compensation: 0.0
+yaw_compensation: 0.0
+
+# 控制参数
+COMMAND_TIMESPAN: 0.02
+delay_time: 0.01
+eTime: 0.01
+
+# 能量机关参数
+fan_height: 2.5
+fan_radius: 0.5

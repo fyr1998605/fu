@@ -1,0 +1,12 @@
+<launch>
+    <!-- Host receipt-to-exposure estimate; calibrate for this camera. -->
+    <arg name="frame_receipt_delay_sec" default="0.0" />
+    <!-- 默认保持相机配置里的 120fps; 打符链路可在 include 时传更低帧率。 -->
+    <arg name="frame_rate" default="120" />
+    <rosparam file="$(find rm_node)/config/camera.yaml" command="load"/>
+    <param name="FrameRate" value="$(arg frame_rate)" />
+    <param name="FrameRateEnable" value="true" />
+    <node pkg="rm_hikcamera" type="hikcamera" name="hikcamera" respawn="true" output="log">
+        <param name="frame_receipt_delay_sec" value="$(arg frame_receipt_delay_sec)" />
+    </node>
+</launch>
